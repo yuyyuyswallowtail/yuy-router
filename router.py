@@ -20,6 +20,7 @@ Per-command options in commands.json:
   "args": "query"       -> the whole sentence is passed as a single argument
   "keywords": [...]     -> words/phrases that add a score bonus when found in the sentence
   "sudo": true          -> run with sudo, always asks for confirmation
+  "confirm": true       -> always ask for confirmation, even inside home
   "timeout": seconds    -> time limit (default 30, or 3600 for sudo)
 "cwd": "." means the folder where yuy was started.
 Placeholders in cmd and cwd: {ROOT} (project folder), {LLAMA_SERVER}.
@@ -399,6 +400,10 @@ def execute(best, cmd, prefix=""):
         print(f"{prefix}WARNING: this command uses sudo (root privileges).")
         if not confirm(cmdline, best["cwd"], prefix):
             print(f"{prefix}Cancelled.")
+            return
+    elif best.get("confirm"):
+        if not confirm(cmdline, best["cwd"]):
+            print("Cancelled.")
             return
     elif AUTO_ALLOW_HOME and in_home(best["cwd"]):
         dbg(f"{prefix}Running (auto-allowed, working directory inside home): {cmdline}")

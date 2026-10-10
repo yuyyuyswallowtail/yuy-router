@@ -96,3 +96,19 @@ Add one object to `commands.json`:
     bin/yuy          launcher
     math/calc.go     calculator (any operands and operators)
     system/info.py   system info and controls
+
+## File and web tools
+
+`tools/files.py` adds file and web commands. Paths must be inside your home folder, and `edit` and `delete` always ask first (`"confirm": true`).
+yuy “search TODO in ~/Projects” # by name, falls back to file content
+yuy “search content ‘useState’ in ./src”
+yuy “read ~/notes.txt lines 10-40”
+yuy ‘create ~/notes.txt with “hello”’
+yuy “create folder ~/Projects/new-app”
+yuy ‘edit ~/notes.txt replace “old” with “new”’ # add the word all to replace every match
+yuy ‘edit ~/notes.txt append “one more line”’
+yuy “delete ~/old.txt” # moved to ~/.local/share/yuy-trash
+yuy “fetch https://example.com” # page text in the terminal
+yuy “open https://example.com in browser” # xdg-open
+
+Quote the text you want to write or replace. Edits keep a backup in the trash folder.
