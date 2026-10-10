@@ -1,0 +1,103 @@
+[
+  {
+    "desc": "calculate a math expression: addition, subtraction, multiplication, division, power, modulo, parentheses, e.g. (2 + 3) * 4",
+    "cmd": ["go", "run", "calc.go"],
+    "cwd": "{ROOT}/math",
+    "args": "expression"
+  },
+  {
+    "desc": "show operating system info: OS name, distro, kernel version, hostname, uptime, desktop",
+    "cmd": ["python3", "{ROOT}/system/info.py", "os"],
+    "cwd": "~",
+    "keywords": ["operating system", "kernel", "distro", "hostname", "uptime", "sistem operasi"]
+  },
+  {
+    "desc": "show CPU processor info: model, cores and threads, usage percentage, frequency, load average",
+    "cmd": ["python3", "{ROOT}/system/info.py", "cpu"],
+    "cwd": "~",
+    "keywords": ["cpu", "processor", "prosesor"]
+  },
+  {
+    "desc": "show GPU graphics card info: model, VRAM, video memory usage, GPU load",
+    "cmd": ["python3", "{ROOT}/system/info.py", "gpu"],
+    "cwd": "~",
+    "keywords": ["gpu", "vram", "graphics card", "kartu grafis"]
+  },
+  {
+    "desc": "show laptop battery: capacity percentage, charging or discharging status, battery health, time remaining",
+    "cmd": ["python3", "{ROOT}/system/info.py", "battery"],
+    "cwd": "~",
+    "keywords": ["battery", "baterai", "charging"]
+  },
+  {
+    "desc": "show temperature sensors for CPU, GPU, and disk in degrees celsius",
+    "cmd": ["python3", "{ROOT}/system/info.py", "temp"],
+    "cwd": "~",
+    "keywords": ["temperature", "temp", "celsius", "suhu", "temperatur"]
+  },
+  {
+    "desc": "show the current time: clock, date, day, month, and year today",
+    "cmd": ["python3", "{ROOT}/system/info.py", "time"],
+    "cwd": "~",
+    "keywords": ["what time", "current time", "what date", "what day", "what month", "what year", "jam berapa", "tanggal berapa", "tanggal hari ini", "hari apa", "bulan apa", "tahun berapa", "waktu sekarang"]
+  },
+  {
+    "desc": "check or change the speaker volume: volume percentage, increase, decrease, mute",
+    "cmd": ["python3", "{ROOT}/system/info.py", "volume"],
+    "cwd": "~",
+    "args": "query",
+    "keywords": ["volume", "sound", "speaker", "mute", "unmute", "suara", "bisukan"]
+  },
+  {
+    "desc": "check or change the screen brightness: percentage, increase, decrease, brighter, dimmer",
+    "cmd": ["python3", "{ROOT}/system/info.py", "brightness"],
+    "cwd": "~",
+    "args": "query",
+    "keywords": ["brightness", "screen brightness", "kecerahan", "kecerahan layar"]
+  },
+  {
+    "desc": "show the folder structure as a directory tree, without node_modules, dist, .next, .git",
+    "cmd": ["python3", "{ROOT}/system/info.py", "tree"],
+    "cwd": ".",
+    "args": "query",
+    "keywords": ["tree", "folder structure", "directory tree", "struktur folder", "pohon folder"]
+  },
+  {
+    "desc": "check system RAM memory usage: total, used, free memory",
+    "cmd": ["free", "-h"],
+    "cwd": "~",
+    "keywords": ["ram", "memory", "memori"]
+  },
+  {
+    "desc": "check free disk space and storage: size, used, partitions",
+    "cmd": ["df", "-h"],
+    "cwd": "~",
+    "keywords": ["disk", "storage", "penyimpanan"]
+  },
+  {
+    "desc": "check the installed Go version",
+    "cmd": ["go", "version"],
+    "cwd": "~",
+    "keywords": ["go version", "versi go"]
+  },
+  {
+    "desc": "list the yuy project folder with ls -la, a simple file listing",
+    "cmd": ["ls", "-la"],
+    "cwd": "{ROOT}",
+    "keywords": ["project folder", "yuy folder", "isi folder yuy"]
+  },
+  {
+    "desc": "list Vulkan devices for llama.cpp, llama-server list-devices",
+    "cmd": ["{LLAMA_SERVER}", "--list-devices"],
+    "cwd": "~",
+    "keywords": ["vulkan", "llama.cpp", "llama-server"]
+  },
+  {
+    "desc": "update the system and all Arch packages with pacman, system upgrade",
+    "cmd": ["pacman", "-Syu"],
+    "cwd": "~",
+    "sudo": true,
+    "timeout": 3600,
+    "keywords": ["update system", "system update", "upgrade system", "pacman", "update sistem", "upgrade sistem"]
+  }
+]

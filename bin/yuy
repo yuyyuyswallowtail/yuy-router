@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Peluncur yuy: menemukan folder proyek dari lokasi skrip ini (mengikuti symlink).
+DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+exec python3 "$DIR/router.py" "$@"

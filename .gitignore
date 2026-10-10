@@ -1,0 +1,7 @@
+config.json
+llama-embed.log
+.llama-embed.lock
+__pycache__/
+*.pyc
+index.json
+work/

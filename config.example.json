@@ -1,0 +1,5 @@
+{
+  "llama_server": "/path/to/llama.cpp/build/bin/llama-server",
+  "embed_model": "/path/to/embeddinggemma-2-BF16.gguf",
+  "port": 8081
+}
