@@ -25,7 +25,7 @@ One sentence can hold several tasks joined by `and`, `then`, `after that`, `dan`
     yuy "calculate 7 x 6 then what time is it"
 
 - Every part is routed on its own and must pass the same score and gap checks. If any part is unclear, the whole sentence is treated as one task, so sentences like "capacity and status of the battery" still work.
-- The plan is printed first and the tasks run in order. `sudo` tasks ask for confirmation one by one, and exact duplicates run once.
+- The tasks run in order, each under its own label (add `-d` to see the plan with scores first). `sudo` tasks ask for confirmation one by one, and exact duplicates run once.
 - If a task cannot be built (for example no math expression is found), nothing from the plan runs.
 - Give each part enough context: `calculate 3 + 3 and calculate 4 * 5` works, `calculate 3 + 3 and 4 * 5` does not.
 
@@ -59,10 +59,13 @@ Make sure `~/.local/bin` is in your `PATH`.
 ## Usage
 
     yuy "your sentence"
-    yuy --list      list commands
-    yuy --status    embedding server status
-    yuy --stop      stop the embedding server
-    yuy --help      show the help
+    yuy -l, --list      list commands
+    yuy -s, --status    embedding server status
+    yuy -S, --stop      stop the embedding server
+    yuy -h, --help      show the help
+    yuy -d, --debug     show scores, matches, and the exact commands that run
+
+By default only the result of each task is printed. With `-d` you also get the top matches, scores, gaps, and the exact command lines.
 
 ## Adding a command
 

@@ -12,6 +12,9 @@ Multiple tasks: one sentence can hold several tasks joined by "and", "then", "af
 clearly matches a command, all of them run in order. When any part is unclear, the whole
 sentence is treated as one task. Give each part enough context ("calculate 3 + 3 and gpu info").
 
+Output: by default only the result of each task is printed. With -d/--debug the top
+matches, scores, gaps, the plan, and the exact command lines are shown too.
+
 Per-command options in commands.json:
   "args": "expression"  -> math expression extracted from the sentence
   "args": "query"       -> the whole sentence is passed as a single argument
@@ -24,17 +27,7 @@ Placeholders in cmd and cwd: {ROOT} (project folder), {LLAMA_SERVER}.
 Commands whose working directory is inside the home folder run without confirmation
 (AUTO_ALLOW_HOME). sudo commands and folders outside home always ask first.
 
-Input (the shell reads ( ) * & ; | $ ! before yuy starts, so quote the sentence when it has them):
-  yuy "your sentence"
-  yuy gpu info                  no quotes needed when there are no special characters
-  yuy                           interactive prompt, no quoting needed
-  echo "your sentence" | yuy    piped input
-
-Usage:
-  yuy --list      list commands
-  yuy --status    embedding server status
-  yuy --stop      stop the embedding server
-  yuy --help      show this help
+Run "yuy --help" for the short usage text.
 """
 import fcntl
 import json
@@ -45,13 +38,46 @@ import shutil
 import signal
 import subprocess
 import sys
+import textwrap
 import time
 import urllib.error
 import urllib.request
 
+HELP = """
+yuy - semantic command router (EmbeddingGemma 2 + llama.cpp)
+
+Usage:
+  yuy "your sentence"        run the command that best matches the sentence
+  yuy                        interactive prompt (no quoting needed)
+  echo "..." | yuy           piped input
+
+Options:
+  -l, --list      list the available commands
+  -s, --status    show the embedding server status
+  -S, --stop      stop the embedding server
+  -d, --debug     also show matches, scores, and the exact commands that run
+  -h, --help      show this help
+
+Examples:
+  yuy "calculate (2 + 3) * 4 ^ 2"
+  yuy "gpu info, cpu info and battery status"
+  yuy "set brightness to 60"
+
+Notes:
+  - Quote the sentence when it has ( ) * & ; | $ ! (the shell reads them first).
+  - Join several tasks with and, then, dan, lalu, a comma, or a semicolon.
+  - Commands live in commands.json (see README.md). Only those commands can run.
+"""
+
 HOME = os.path.expanduser("~")
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = f"{HERE}/config.json"
+DEBUG = False  # set by -d/--debug
+
+
+def dbg(*parts):
+    if DEBUG:
+        print(*parts)
 
 
 def load_config():
@@ -181,15 +207,20 @@ def ensure_server():
                     stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                     start_new_session=True,  # keeps running after the router exits
                 )
-            print(f"Starting the embedding llama-server in the background (PID {proc.pid})...")
-        else:
+            if DEBUG:
+                print(f"Starting the embedding llama-server in the background (PID {proc.pid})...")
+            else:
+                print("Starting the embedding server...")
+        elif DEBUG:
             shown = ", ".join(map(str, pids)) or "?"
             print(f"llama-server is already running (PID {shown}), waiting until it is ready...")
+        else:
+            print("Waiting for the embedding server...")
 
         deadline = time.time() + START_TIMEOUT
         while time.time() < deadline:
             if server_state() == "ready":
-                print("Server ready.")
+                dbg("Server ready.")
                 return True
             if proc and proc.poll() is not None:
                 print(f"llama-server exited with code {proc.returncode}. Last log lines:\n{tail_log()}")
@@ -265,6 +296,11 @@ def load_commands():
     return commands
 
 
+def short_desc(c):
+    """A short readable label for a command: the description up to the first colon."""
+    return textwrap.shorten(c["desc"].split(":")[0].strip(), width=60, placeholder="...")
+
+
 def embed(texts):
     req = urllib.request.Request(
         EMBED_URL,
@@ -303,6 +339,16 @@ def pick(scored):
         return None, best_score, margin, (
             f"Gap below {MIN_MARGIN}, the choice is unclear. Try a more specific sentence.")
     return best, best_score, margin, ""
+
+
+def rejection_text(text, scored):
+    """Readable message for a sentence that did not match clearly (no scores)."""
+    if scored[0][0] < THRESHOLD or len(scored) < 2:
+        return f'No matching command for: "{text}"\nTry --debug to see how it was scored.'
+    first, second = short_desc(scored[0][2]), short_desc(scored[1][2])
+    return (f'Not sure what you mean by: "{text}"\n'
+            f"Closest: {first} / {second}\n"
+            "Be more specific, or try --debug to see the scores.")
 
 
 # ---------------------------------------------------------------- running
@@ -355,7 +401,7 @@ def execute(best, cmd, prefix=""):
             print(f"{prefix}Cancelled.")
             return
     elif AUTO_ALLOW_HOME and in_home(best["cwd"]):
-        print(f"{prefix}Running (auto-allowed, working directory inside home): {cmdline}")
+        dbg(f"{prefix}Running (auto-allowed, working directory inside home): {cmdline}")
     elif not confirm(cmdline, best["cwd"], prefix):
         print(f"{prefix}Cancelled.")
         return
@@ -365,7 +411,8 @@ def execute(best, cmd, prefix=""):
         if is_sudo:
             # the terminal is passed through as-is: password prompt and output show up live
             res = subprocess.run(cmd, cwd=best["cwd"], timeout=timeout)
-            print(f"Finished with exit code {res.returncode}.")
+            if DEBUG or res.returncode != 0:
+                print(f"Finished with exit code {res.returncode}.")
             return
         res = subprocess.run(cmd, cwd=best["cwd"], capture_output=True, text=True, timeout=timeout)
     except (FileNotFoundError, PermissionError):
@@ -377,24 +424,46 @@ def execute(best, cmd, prefix=""):
     except KeyboardInterrupt:
         print("\nInterrupted.")
         return
-    print("== Output ==")
-    print(res.stdout or res.stderr)
+
+    out, err = res.stdout.rstrip(), res.stderr.rstrip()
+    if DEBUG:
+        print("== Output ==")
+        print(out if out else "(no output)")
+        if err:
+            print("== Errors ==")
+            print(err)
+    else:
+        if out:
+            print(out)
+        if err and (res.returncode != 0 or not out):
+            print(err)
+        if not out and not err and res.returncode == 0:
+            print("Done.")
     if res.returncode != 0:
         print(f"(exit code {res.returncode})")
 
 
-def run_single(query, qv, commands, dvs, note=""):
+def run_single(query, qv, commands, dvs, split_fail=None):
+    """split_fail: (number of parts, first unclear part) when splitting into tasks was tried."""
     scored = rank(query, qv, commands, dvs)
-    print("== Matches ==")
-    for score, boosted, c in scored[:3]:
-        print(f"[{score:.3f}] {c['_raw']}  ({c['desc']}){' (+bonus)' if boosted else ''}")
-
     best, score, margin, why = pick(scored)
-    print(f"\nBest score {score:.3f}, gap to runner-up: {margin:.3f}")
+    if DEBUG:
+        print("== Matches ==")
+        for s, boosted, c in scored[:3]:
+            print(f"[{s:.3f}] {c['_raw']}  ({c['desc']}){' (+bonus)' if boosted else ''}")
+        print(f"\nBest score {score:.3f}, gap to runner-up: {margin:.3f}")
+
     if not best:
-        if note:
-            print(note)
-        print(why)
+        if DEBUG:
+            if split_fail:
+                print(f'Tried splitting into {split_fail[0]} tasks, but "{split_fail[1]}" did not match '
+                      "a command clearly, so the sentence was treated as one task.")
+            print(why)
+        elif split_fail:
+            print(f'Could not match "{split_fail[1]}" to a command.\n'
+                  "Try --debug to see how it was scored.")
+        else:
+            print(rejection_text(query, scored))
         return
 
     cmd = build_cmd(best, query)
@@ -415,13 +484,20 @@ def run_plan(picks):
         seen.add(tuple(cmd))
         tasks.append((part, best, cmd, score, margin))
 
-    print(f"== Plan: {len(tasks)} tasks ==")
-    for i, (part, best, cmd, score, margin) in enumerate(tasks, 1):
-        sudo = "sudo " if best.get("sudo") else ""
-        print(f'{i}. "{part}" -> {sudo}{show(cmd)}  (score {score:.3f}, gap {margin:.3f})')
+    n = len(tasks)
+    if DEBUG:
+        print(f"== Plan: {n} tasks ==")
+        for i, (part, best, cmd, score, margin) in enumerate(tasks, 1):
+            sudo = "sudo " if best.get("sudo") else ""
+            print(f'{i}. "{part}" -> {sudo}{show(cmd)}  (score {score:.3f}, gap {margin:.3f})')
     for i, (part, best, cmd, _, _) in enumerate(tasks, 1):
-        print()
-        execute(best, cmd, prefix=f"[{i}/{len(tasks)}] ")
+        if DEBUG or i > 1:
+            print()
+        if DEBUG:
+            execute(best, cmd, prefix=f"[{i}/{n}] ")
+        else:
+            print(f"[{i}/{n}] {part}")
+            execute(best, cmd)
 
 
 def handle(query):
@@ -444,7 +520,7 @@ def handle(query):
         return
     qvs, dvs = vecs[:len(texts)], vecs[len(texts):]
 
-    note = ""
+    split_fail = None
     if len(parts) > 1:
         picks = []
         for part, qv in zip(parts, qvs[1:]):
@@ -453,9 +529,8 @@ def handle(query):
         if all(p[1] for p in picks):
             return run_plan(picks)
         bad = next(p for p in picks if not p[1])
-        note = (f'Tried splitting into {len(parts)} tasks, but "{bad[0]}" did not match a command '
-                "clearly, so the sentence was treated as one task.")
-    run_single(query, qvs[0], commands, dvs, note)
+        split_fail = (len(parts), bad[0])
+    run_single(query, qvs[0], commands, dvs, split_fail)
 
 
 def interactive():
@@ -479,26 +554,42 @@ def interactive():
             handle(line)
 
 
+def cmd_list():
+    try:
+        commands = load_commands()
+    except (OSError, json.JSONDecodeError, KeyError) as e:
+        print(f"Failed to read {COMMANDS_FILE}: {e}")
+        return
+    for c in commands:
+        marks = []
+        if c.get("sudo"):
+            marks.append("sudo")
+        if c.get("args") == "expression":
+            marks.append("<expression>")
+        elif c.get("args") == "query":
+            marks.append("<sentence>")
+        line = f"{short_desc(c):<62} {' '.join(marks)}".rstrip()
+        if DEBUG:
+            line += f"   -> {'sudo ' if c.get('sudo') else ''}{c['_raw']}"
+        print(line)
+
+
 def main():
+    global DEBUG
     args = sys.argv[1:]
+    if any(a in ("-d", "--debug") for a in args):
+        DEBUG = True
+        args = [a for a in args if a not in ("-d", "--debug")]
+
     if args and args[0] in ("-h", "--help"):
-        print(__doc__)
+        print(HELP.strip())
         return
-    if args and args[0] == "--status":
+    if args and args[0] in ("-s", "--status"):
         return cmd_status()
-    if args and args[0] == "--stop":
+    if args and args[0] in ("-S", "--stop"):
         return cmd_stop()
-    if args and args[0] == "--list":
-        try:
-            commands = load_commands()
-        except (OSError, json.JSONDecodeError, KeyError) as e:
-            print(f"Failed to read {COMMANDS_FILE}: {e}")
-            return
-        suffixes = {"expression": " <expression>", "query": " <sentence>"}
-        for c in commands:
-            shown = ("sudo " if c.get("sudo") else "") + c["_raw"] + suffixes.get(c.get("args"), "")
-            print(f"{shown:55} {c['desc']}")
-        return
+    if args and args[0] in ("-l", "--list"):
+        return cmd_list()
 
     if args:
         handle(" ".join(args))
