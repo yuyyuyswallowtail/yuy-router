@@ -200,7 +200,7 @@ def cmd_battery(_q):
         st = read(b + "/status") or "Unknown"
         print(os.path.basename(b))
         row("  Capacity", f"{read(b + '/capacity')}%")
-        row("  Status", f"{STATUS_EN.get(st, st)} ({st})")
+        row("  Status", STATUS_EN.get(st, st))
         now, full, design, rate = (num(b + "/energy_now"), num(b + "/energy_full"),
                                    num(b + "/energy_full_design"), num(b + "/power_now"))
         if now is None:
