@@ -4,10 +4,11 @@
 rank_results   sorts search results by how well they match the query. It uses EmbeddingGemma
                through the local llama-server (the one router.py starts) and falls back to plain
                word matching when that server cannot be reached.
-show_relevant  reads the most relevant pages in parallel and prints a direct answer: the sentences
-               that match the query best, picked with EmbeddingGemma (extractive, nothing is
-               generated), each tagged with the pages that say the same. With -d/--debug (or
-               YUY_DEBUG=1) the matching paragraphs of every page are printed as well.
+show_relevant  reads the most relevant pages in parallel and prints a direct answer: complete,
+               self-contained sentences that match the query best, picked with EmbeddingGemma
+               (extractive, nothing is generated), each tagged with the pages that say the same.
+               With -d/--debug (or YUY_DEBUG=1) the candidate table and the matching paragraphs
+               of every page are printed as well.
 
 Numbers in the query ("14" in "laravel 14") must appear in a result, paragraph, or sentence to count.
 """
@@ -41,10 +42,17 @@ ANSWER_SENTENCES = 4       # sentences in the answer at most
 ANSWER_WINDOW = 0.12       # only sentences within this score distance of the best one
 PER_SOURCE_ANSWER = 2      # sentences per page at most
 SENTENCES_PER_PAGE = 12    # candidate sentences per page that get embedded
-AGREE = 0.82               # cosine above which sentences from two pages say the same thing
+MIN_SENT_CHARS = 35        # shortest sentence that can be part of the answer
+MIN_SENT_WORDS = 6
+AGREE_FLOOR = 0.85         # sentences from two pages agree only above this cosine ...
+AGREE_PERCENTILE = 0.95    # ... and above this percentile of all cross-page sentence pairs
+MAX_SUPPORT = 3            # pages named as support for one sentence at most
 DUP = 0.92                 # cosine above which two sentences are near duplicates
 CONSENSUS_BONUS = 0.08     # score bonus when other pages agree (two pages count at most)
 SENT_PHRASE_BONUS = 0.05   # the sentence holds the query words next to each other
+FACT_BONUS = 0.04          # dates, versions, and other numbers (three count at most)
+RANK_BONUS = 0.04          # sentences from higher ranked pages score a little higher
+YOU_PENALTY = 0.05         # "you/your" voice (tutorials, marketing)
 
 STOP = set("""the a an of in on for to and or is are was were be what how why when where which who
 about with web search websearch lookup look up cari carikan tentang di internet online dan yang
@@ -52,10 +60,16 @@ apa itu untuk dari""".split())
 TOKEN = re.compile(r"\w+(?:\.\w+)*")
 CODE_CHARS = set("$;{}<>[]=\\|`")
 SENT_SPLIT = re.compile(r'(?<=[.!?])\s+(?=[A-Z0-9"“(\[])')
+SENT_END = re.compile(r"(?:[.!?][\"”')\]]*|\.{3}|…)$")
 BOILER = re.compile(
     r"\b(cookies?|subscribe|newsletter|sign up|log in|privacy policy|terms of (?:use|service)|"
     r"all rights reserved|follow us|share this|read more|advertisement|click here|table of contents)\b",
     re.I)
+# sentences that start like this only make sense with the sentence before them
+ANAPHORA = re.compile(
+    r"^(?:this|that|these|those|it|its|they|their|he|she|here|there|but|and|so|also|however|then|such|"
+    r"none|nothing|whatever|anything|everything|otherwise|instead|thus|therefore|meanwhile)\b", re.I)
+YOU = re.compile(r"\b(?:you|your|yours|you'll|you've|you're|yourself)\b", re.I)
 
 
 def debug_on():
@@ -257,8 +271,17 @@ def excerpts(text, words, nums, phrase, strict):
     return [window(b, focus, EXCERPT_CHARS) for _, b in sorted(picked)]
 
 
+def good_sentence(s):
+    """A complete sentence that still makes sense on its own (no titles, breadcrumbs, or 'This is ...')."""
+    return (MIN_SENT_CHARS <= len(s) <= 420 and len(s.split()) >= MIN_SENT_WORDS
+            and (s[0].isupper() or s[0].isdigit())
+            and bool(SENT_END.search(s)) and not s.endswith("?")
+            and s.count("/") < 2
+            and not ANAPHORA.match(s) and not BOILER.search(s) and not looks_like_noise(s))
+
+
 def page_sentences(text):
-    """Complete sentences of a page, without headings, code, menus, questions, and boilerplate."""
+    """Self-contained sentences of a page, without headings, code, menus, questions, and boilerplate."""
     out = []
     for b in blocks(text):
         if b.startswith("#") or looks_like_noise(b):
@@ -267,8 +290,7 @@ def page_sentences(text):
             b = b[2:]
         for s in SENT_SPLIT.split(b):
             s = s.strip()
-            if (40 <= len(s) <= 420 and not s.endswith("?") and not BOILER.search(s)
-                    and not looks_like_noise(s)):
+            if good_sentence(s):
                 out.append(s)
     return out
 
@@ -278,10 +300,15 @@ def snippet_sentence(snippet):
     s = " ".join(snippet.split())
     s = re.sub(r"^[A-Z][a-z]{2} \d{1,2}, \d{4}\s*(?:\.{2,}|…)?\s*", "", s)
     s = re.sub(r"\s+([,.;:!?])", r"\1", s).strip()
-    return s if len(s) >= 40 and not BOILER.search(s) else ""
+    return s if s and good_sentence(s) else ""
 
 
 # ---------------------------------------------------------------- the answer
+
+def query_variants(query):
+    """Several ways to ask for the same thing, so facts beat sentences that merely repeat the keywords."""
+    return [query, f"What is {query}?", f"Key facts and details about {query}"]
+
 
 def lexical(s, words, phrase):
     hits = sum(1 for w in words if has(s, w))
@@ -312,19 +339,34 @@ def build_candidates(pairs, words, nums, phrase, strict):
             if s.lower() in seen:
                 continue
             seen.add(s.lower())
-            cands.append({"text": s, "src": r["rank"], "lex": score})
+            cands.append({"text": s, "src": r["rank"], "lex": score, "support": []})
     return cands
 
 
-def agree(a, b):
-    return bool(a.get("vec") and b.get("vec")) and dot(a["vec"], b["vec"]) >= AGREE
+def assign_support(cands):
+    """Name the pages that say the same as each sentence. -> the agreement threshold that was used."""
+    sims = [dot(a["vec"], b["vec"]) for i, a in enumerate(cands) for b in cands[i + 1:]
+            if a["src"] != b["src"]]
+    if not sims:
+        return None
+    sims.sort()
+    threshold = max(AGREE_FLOOR, sims[min(int(len(sims) * AGREE_PERCENTILE), len(sims) - 1)])
+    for c in cands:
+        best = {}
+        for o in cands:
+            if o["src"] != c["src"]:
+                s = dot(c["vec"], o["vec"])
+                if s >= threshold and s > best.get(o["src"], 0.0):
+                    best[o["src"]] = s
+        c["support"] = [src for src, _ in sorted(best.items(), key=lambda kv: -kv[1])[:MAX_SUPPORT]]
+    return threshold
 
 
 def duplicate(a, b):
-    if a.get("vec") and b.get("vec"):
-        return dot(a["vec"], b["vec"]) >= DUP
     wa, wb = set(TOKEN.findall(a["text"].lower())), set(TOKEN.findall(b["text"].lower()))
-    return bool(wa and wb) and len(wa & wb) / len(wa | wb) >= 0.6
+    if wa and wb and len(wa & wb) / len(wa | wb) >= 0.7:
+        return True
+    return bool(a.get("vec") and b.get("vec")) and dot(a["vec"], b["vec"]) >= DUP
 
 
 def select(cands):
@@ -351,28 +393,39 @@ def print_answer(query, pairs, words, nums, phrase, strict, width):
     cands = build_candidates(pairs, words, nums, phrase, strict)
     if not cands:
         return False
-    qvec = None
+
+    variants = query_variants(query)
+    qvecs, threshold = None, None
     try:
-        vecs = embed_many([f"task: search result | query: {query}"]
+        vecs = embed_many([f"task: search result | query: {v}" for v in variants]
                           + [f"title: none | text: {c['text']}" for c in cands])
-        qvec = vecs[0]
-        for c, v in zip(cands, vecs[1:]):
+        qvecs = vecs[:len(variants)]
+        for c, v in zip(cands, vecs[len(variants):]):
             c["vec"] = v
+        threshold = assign_support(cands)
     except (urllib.error.URLError, OSError, KeyError, ValueError, IndexError):
-        pass
+        qvecs = None
+        for c in cands:
+            c.pop("vec", None)
+            c["support"] = []
 
     for c in cands:
-        base = dot(qvec, c["vec"]) if qvec else c["lex"]
-        c["support"] = sorted({o["src"] for o in cands if o["src"] != c["src"] and agree(c, o)})
-        c["score"] = (base + (SENT_PHRASE_BONUS if phrase and phrase.search(c["text"]) else 0.0)
-                      + CONSENSUS_BONUS * min(len(c["support"]), 2) / 2)
+        qcos = sum(dot(q, c["vec"]) for q in qvecs) / len(qvecs) if qvecs else c["lex"]
+        facts = [t for t in re.findall(r"\d+(?:\.\d+)*", c["text"]) if t not in nums]
+        c["qcos"] = qcos
+        c["score"] = (qcos
+                      + (SENT_PHRASE_BONUS if phrase and phrase.search(c["text"]) else 0.0)
+                      + CONSENSUS_BONUS * min(len(c["support"]), 2) / 2
+                      + FACT_BONUS * min(len(facts), 3) / 3
+                      + RANK_BONUS * (TRIES - min(c["src"], TRIES)) / TRIES
+                      - (YOU_PENALTY if YOU.search(c["text"]) else 0.0))
 
     chosen = select(cands)
     if not chosen:
         return False
 
     print(f"\n== Answer: {query} ==")
-    if qvec is None:
+    if qvecs is None:
         print("(embedding server not reachable: sentences picked by word match only)")
     used = set()
     for c in chosen:
@@ -389,6 +442,15 @@ def print_answer(query, pairs, words, nums, phrase, strict, width):
         if r:
             title = textwrap.shorten(" ".join(r["title"].split()), width=80, placeholder="...")
             print(f"[{t}] {title} ({host_of(r['url'])})\n    {r['url']}")
+
+    if debug_on():
+        print("\n== Answer candidates (debug): score, query cosine, supporting pages, page, sentence ==")
+        for c in sorted(cands, key=lambda c: -c["score"])[:10]:
+            mark = "*" if c in chosen else " "
+            print(f"{mark} {c['score']:.3f} q={c['qcos']:.3f} sup={len(c['support'])} "
+                  f"[{c['src']}] {textwrap.shorten(c['text'], width=100, placeholder='...')}")
+        if threshold is not None:
+            print(f"(agreement threshold {threshold:.3f}, {len(cands)} candidate sentences)")
     return True
 
 
