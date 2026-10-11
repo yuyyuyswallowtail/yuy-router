@@ -23,6 +23,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import textwrap
 import time
 import urllib.error
 import urllib.parse
@@ -312,36 +313,122 @@ def do_delete(s):
 
 # ---------------------------------------------------------------- web actions
 
-class TextExtractor(HTMLParser):
-    SKIP = {"script", "style", "noscript", "svg", "template"}
-    BLOCK = {"p", "div", "br", "li", "tr", "section", "article", "header", "footer", "ul", "ol",
-             "table", "pre", "blockquote", "h1", "h2", "h3", "h4", "h5", "h6"}
+def term_width():
+    try:
+        cols = os.get_terminal_size(0).columns  # stdin is still the terminal when stdout is captured
+    except OSError:
+        cols = 100
+    return max(60, min(cols, 110))
 
-    def __init__(self):
+
+class TextExtractor(HTMLParser):
+    """HTML -> readable text: headings as '#', list items as '-', page chrome (menus, footer) dropped."""
+    SKIP_ALWAYS = {"script", "style", "noscript", "svg", "template", "iframe", "dialog", "select", "button"}
+    SKIP_CHROME = {"nav", "footer", "aside", "form"}
+    HEADING = {"h1": "# ", "h2": "## ", "h3": "## ", "h4": "### ", "h5": "### ", "h6": "### "}
+    PARA = {"p", "ul", "ol", "table", "pre", "blockquote", "section", "article", "main", "figure",
+            "details", "dl"}
+    LINE = {"div", "br", "tr", "dt", "dd", "figcaption"}
+    BREAK = "\n\x00\n"  # paragraph break marker; plain newlines are only line breaks
+
+    def __init__(self, strict=True):
         super().__init__(convert_charrefs=True)
-        self.out, self.title, self.skip, self.in_title = [], "", 0, False
+        self.strict = strict
+        self.all, self.main, self.skipped = [], [], []
+        self.title, self.in_title = "", False
+        self.main_depth = self.article_depth = 0
+
+    def out(self, text):
+        if not self.skipped:
+            self.all.append(text)
+            if self.main_depth:
+                self.main.append(text)
 
     def handle_starttag(self, tag, attrs):
-        if tag in self.SKIP:
-            self.skip += 1
-        elif tag == "title":
+        if tag == "title":
             self.in_title = True
-        elif tag in self.BLOCK:
-            self.out.append("\n")
+            return
+        site_header = tag == "header" and not (self.main_depth or self.article_depth)
+        if tag in self.SKIP_ALWAYS or (self.strict and (tag in self.SKIP_CHROME or site_header)):
+            self.skipped.append(tag)
+            return
+        if tag == "main":
+            self.main_depth += 1
+        elif tag == "article":
+            self.article_depth += 1
+        if tag in self.HEADING:
+            self.out(self.BREAK + self.HEADING[tag])
+        elif tag == "li":
+            self.out("\n- ")
+        elif tag in self.PARA:
+            self.out(self.BREAK)
+        elif tag in self.LINE:
+            self.out("\n")
 
     def handle_endtag(self, tag):
-        if tag in self.SKIP:
-            self.skip = max(self.skip - 1, 0)
-        elif tag == "title":
+        if tag == "title":
             self.in_title = False
-        elif tag in self.BLOCK:
-            self.out.append("\n")
+            return
+        if tag in self.skipped:  # also repairs a missing end tag inside a skipped block
+            del self.skipped[len(self.skipped) - 1 - self.skipped[::-1].index(tag):]
+            return
+        if tag == "main":
+            self.main_depth = max(self.main_depth - 1, 0)
+        elif tag == "article":
+            self.article_depth = max(self.article_depth - 1, 0)
+        if tag in self.HEADING or tag in self.PARA:
+            self.out(self.BREAK)
+        elif tag in self.LINE:
+            self.out("\n")
 
     def handle_data(self, data):
         if self.in_title:
             self.title += data
-        elif not self.skip:
-            self.out.append(data)
+        else:
+            self.out(data)
+
+
+def tidy(raw):
+    """Collapse spaces, drop repeated short lines (menu leftovers), wrap to the terminal width."""
+    width, seen, lines = term_width(), set(), []
+    for line in raw.splitlines():
+        if line == "\x00":  # paragraph break
+            if lines and lines[-1] != "":
+                lines.append("")
+            continue
+        line = re.sub(r"\s+", " ", line).strip()
+        if not line or line in ("-", "#", "##", "###") or len(line) < 3:
+            continue
+        if len(line) <= 40 and not line.startswith("#"):
+            if line in seen:
+                continue
+            seen.add(line)
+        lines.append(textwrap.fill(line, width=width, break_long_words=False, break_on_hyphens=False,
+                                   subsequent_indent="  " if line.startswith("- ") else ""))
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
+def html_to_text(html):
+    """-> (title, text). Uses <main> when the page has one, falls back to a looser parse if too little is left."""
+    for strict in (True, False):
+        p = TextExtractor(strict)
+        p.feed(html)
+        main = tidy("".join(p.main))
+        text = main if len(main) > 300 else tidy("".join(p.all))
+        if len(text) > 200 or not strict:
+            return " ".join(p.title.split()), text
+
+
+def cut_text(text, limit):
+    """-> (text cut at a paragraph or line end, whether something was cut)."""
+    if len(text) <= limit:
+        return text, False
+    head = text[:limit]
+    for sep in ("\n\n", "\n"):
+        i = head.rfind(sep)
+        if i > limit * 0.6:
+            return head[:i].rstrip(), True
+    return head.rstrip(), True
 
 
 def get_url(s):
@@ -383,25 +470,22 @@ def fetch_page(url):
         text = raw[:MAX_DOWNLOAD].decode("utf-8", "replace")
     title = ""
     if ctype in ("text/html", "application/xhtml+xml"):
-        p = TextExtractor()
-        p.feed(text)
-        title = " ".join(p.title.split())
-        lines = [re.sub(r"[ \t]+", " ", ln).strip() for ln in "".join(p.out).splitlines()]
-        text = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+        title, text = html_to_text(text)
     elif not (ctype.startswith("text/") or ctype.endswith(("json", "xml"))):
         raise FetchError(f"not a text page ({ctype})")
     return final, status, ctype, title, text, cut
 
 
-def show_page(page, limit):
+def show_page(page, limit, label=""):
     final, status, ctype, title, text, cut = page
-    print(f"== {final} (HTTP {status}, {ctype}) ==")
+    print(f"== {label}{final} (HTTP {status}, {ctype}) ==")
     if title:
         print(f"Title: {title}")
     print()
-    print(text[:limit])
-    if len(text) > limit or cut:
-        print(f"\n... truncated at {limit} characters ({len(text)} total).")
+    shown, more = cut_text(text, limit)
+    print(shown)
+    if more or cut:
+        print(f"\n... cut here: showing {len(shown)} of {len(text)} characters.")
 
 
 def do_fetch(s):
@@ -504,20 +588,22 @@ def do_websearch(s):
     if not found:
         die("No results parsed (Bing may have shown a captcha or changed its HTML).\n"
             f'Open it yourself: yuy "open {search_url} in browser"')
+    width = term_width()
     for i, x in enumerate(found[:MAX_RESULTS], 1):
         print(f"\n{i}. {' '.join(x['title'].split())}")
         print(f"   {real_url(x['url'])}")
-        if x["snippet"].strip():
-            print(f"   {' '.join(x['snippet'].split())[:200]}")
-    for x in found[:AUTO_TRIES]:
+        snippet = " ".join(x["snippet"].split())
+        if snippet:
+            print(textwrap.fill(snippet, width=width, initial_indent="   ", subsequent_indent="   "))
+    for i, x in enumerate(found[:AUTO_TRIES], 1):
         url = real_url(x["url"])
         try:
             page = fetch_page(url)
         except FetchError as e:
-            print(f"\n(skipped {url}: {e})")
+            print(f"\n(skipped result {i}: {e})")
             continue
         print()
-        show_page(page, AUTO_CHARS)
+        show_page(page, AUTO_CHARS, label=f"Result {i}: ")
         return
     print('\nCould not read any result. Read one yourself: yuy "fetch <url>"')
 
