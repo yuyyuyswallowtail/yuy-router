@@ -5,8 +5,8 @@ rank_results   sorts search results by how well they match the query. It uses Em
                through the local llama-server (the one router.py starts) and falls back to plain
                word matching when that server cannot be reached.
 show_relevant  reads the most relevant pages in parallel and prints the paragraphs that match
-               the query instead of the start of the page. A page that cannot be read is
-               replaced by its search snippet.
+               the query instead of the start of the page. Code samples, menus, and tables of
+               contents are skipped. A page that cannot be read is replaced by its search snippet.
 
 Numbers in the query ("14" in "laravel 14") must appear in a result or paragraph to count.
 """
@@ -23,20 +23,24 @@ from concurrent.futures import ThreadPoolExecutor
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-PHRASE_BONUS = 0.10    # the query words appear next to each other, in order
-NUM_BONUS = 0.15       # every number of the query appears
-NUM_PENALTY = 0.20     # a number of the query is missing
-MIN_WORD_SHARE = 0.6   # a result must hold this share of the query words (and all numbers) to be read
-PAGES = 3              # pages shown at most
-TRIES = 6              # candidate pages fetched (in parallel)
-FETCH_TIMEOUT = 10     # seconds per page
-EXCERPTS = 3           # paragraphs shown per page
-EXCERPT_CHARS = 500    # characters per paragraph
+PHRASE_BONUS = 0.10     # the query words appear next to each other, in order
+NUM_BONUS = 0.15        # every number of the query appears
+NUM_PENALTY = 0.20      # a number of the query is missing
+MIN_WORD_SHARE = 0.6    # a result must hold this share of the query words (and all numbers) to be read
+MIN_BLOCK_SHARE = 0.6   # a paragraph must hold this share of the query words to be shown
+PROSE_BONUS = 0.25      # sentences are preferred over headings
+CODE_DENSITY = 0.04     # share of code-like symbols above which a paragraph counts as a code sample
+PAGES = 3               # pages shown at most
+TRIES = 6               # candidate pages fetched (in parallel)
+FETCH_TIMEOUT = 10      # seconds per page
+EXCERPTS = 3            # paragraphs shown per page (at most one of them a heading)
+EXCERPT_CHARS = 500     # characters per paragraph
 
 STOP = set("""the a an of in on for to and or is are was were be what how why when where which who
 about with web search websearch lookup look up cari carikan tentang di internet online dan yang
 apa itu untuk dari""".split())
 TOKEN = re.compile(r"\w+(?:\.\w+)*")
+CODE_CHARS = set("$;{}<>[]=\\|`")
 
 
 # ---------------------------------------------------------------- words and numbers
@@ -159,6 +163,16 @@ def blocks(text):
     return out
 
 
+def looks_like_noise(b):
+    """Code samples and tables of contents are not worth showing as excerpts."""
+    if b.startswith("#"):  # headings are fine
+        return False
+    if b.count("#") >= 3:  # "Table of contents # New Features# Breaking Changes# ..."
+        return True
+    symbols = sum(1 for ch in b if ch in CODE_CHARS)
+    return symbols / len(b) > CODE_DENSITY
+
+
 def window(block, focus, chars):
     """At most `chars` characters of a block, starting a little before the first match."""
     if len(block) <= chars:
@@ -174,23 +188,33 @@ def window(block, focus, chars):
 
 
 def excerpts(text, words, nums, phrase, strict):
-    """Paragraphs that hold every query word and number (strict) or at least half the words."""
+    """Prose that holds every query number and most query words (half the words when not strict)."""
     need_nums = nums if strict else []
-    min_share = 0.99 if strict else 0.5
+    share = MIN_BLOCK_SHARE if strict else 0.5
+    need_hits = math.ceil(len(words) * share - 1e-9) if words else 0
     focus = phrase or token_re((nums or words or ["."])[0])
     scored = []
     for i, b in enumerate(blocks(text)):
-        if len(b) < 25:
+        if len(b) < 25 or looks_like_noise(b):
             continue
         hits = sum(1 for w in words if has(b, w))
-        if words and hits / len(words) < min_share:
+        if hits < need_hits or not all(has(b, n) for n in need_nums):
             continue
-        if not all(has(b, n) for n in need_nums):
-            continue
-        score = hits / max(len(words), 1) + (0.5 if phrase and phrase.search(b) else 0.0)
-        scored.append((score, i, b))
-    top = sorted(scored, key=lambda x: (-x[0], x[1]))[:EXCERPTS]
-    return [window(b, focus, EXCERPT_CHARS) for _, _, b in sorted(top, key=lambda x: x[1])]
+        heading = b.startswith("#")
+        score = (hits / max(len(words), 1) + (0.5 if phrase and phrase.search(b) else 0.0)
+                 + (0.0 if heading else PROSE_BONUS))
+        scored.append((score, i, heading, b))
+
+    picked, headings = [], 0
+    for score, i, heading, b in sorted(scored, key=lambda x: (-x[0], x[1])):
+        if heading:
+            if headings >= 1:
+                continue
+            headings += 1
+        picked.append((i, b))
+        if len(picked) == EXCERPTS:
+            break
+    return [window(b, focus, EXCERPT_CHARS) for _, b in sorted(picked)]
 
 
 # ---------------------------------------------------------------- output

@@ -90,7 +90,7 @@
     "desc": "list Vulkan devices for llama.cpp, llama-server list-devices",
     "cmd": ["{LLAMA_SERVER}", "--list-devices"],
     "cwd": "~",
-    "keywords": ["vulkan", "llama.cpp", "llama-server"]
+    "keywords": ["vulkan devices", "vulkan device", "list-devices", "list devices"]
   },
   {
     "desc": "update the system and all Arch packages with pacman, system upgrade",
