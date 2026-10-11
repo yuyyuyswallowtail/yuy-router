@@ -8,7 +8,7 @@
   files.py delete  "delete ~/old.txt"        (moved to a trash folder, not removed)
   files.py fetch   "fetch https://example.com"
   files.py browser "open https://example.com in browser"
-  files.py websearch "search the web for laravel 14"   (Bing, then Brave, Mojeek, Yahoo; no API key)
+  files.py websearch "search the web for laravel 14"   (local SearXNG, then Bing, Brave, Mojeek, Yahoo)
   files.py enginetest "laravel 14"                     (which of those engines work from here)
 
 Safety: every path must resolve inside $HOME (symlinks resolved). ~/.ssh ~/.gnupg ~/.aws
@@ -18,6 +18,7 @@ keeps a backup. delete moves to ~/.local/share/yuy-trash. Standard library only.
 import base64
 import difflib
 import fnmatch
+import json
 import os
 import re
 import shlex
@@ -661,9 +662,28 @@ def serp_search(template, own):
     return search
 
 
+# A local SearXNG (https://docs.searxng.org) does the scraping with maintained parsers and answers in JSON.
+SEARXNG = os.environ.get("YUY_SEARXNG_URL", "http://127.0.0.1:8888").rstrip("/")
+
+
+def searxng_search(query):
+    url = f"{SEARXNG}/search?" + urllib.parse.urlencode({"q": query, "format": "json"})
+    try:
+        data = json.loads(http_get(url, timeout=20))
+    except SearchError as e:
+        if str(e) == "HTTP 403":
+            raise SearchError("HTTP 403 (enable the json format: search.formats in settings.yml)")
+        raise
+    except ValueError:
+        raise SearchError("did not answer with JSON")
+    return [{"title": r.get("title") or "", "url": r.get("url") or "", "snippet": r.get("content") or ""}
+            for r in data.get("results", [])]
+
+
 # name, search function, whether to keep only results that mention the query (generic parsing also
 # picks up stray links). DuckDuckGo is left out on purpose: it is blocked in Indonesia.
 ENGINES = (
+    ("SearXNG", searxng_search, False),
     ("Bing", bing_search, False),
     ("Brave", serp_search("https://search.brave.com/search?q={q}&source=web", ("brave.com", "bravesoftware.com")), True),
     ("Mojeek", serp_search("https://www.mojeek.com/search?q={q}", ("mojeek.com", "mojeek.net")), True),
@@ -737,10 +757,12 @@ def do_websearch(s):
 
 def do_enginetest(s):
     """Try every search engine and say which ones work from this machine. Raw pages go to /tmp."""
+    global LAST_HTML
     query = " ".join(w for w in s.split() if w.lower() not in WEB_STOP) or "laravel"
     words = query_words(query)
     print(f"Query: {query}")
     for name, search, strict in ENGINES:
+        LAST_HTML = ""  # so a failed engine does not save the previous engine's page
         started = time.time()
         try:
             results = usable(search(query), words, strict)
