@@ -69,6 +69,8 @@ MMR_WEIGHT = 0.30          # a sentence loses this much times its similarity to 
 HIGHLIGHTS = 8             # key points listed at most
 HL_MIN_PAGES = 2           # a key point must be listed by this many pages (when that many pages have a list)
 HL_MATCH = 0.75            # share of content words two key point names must have in common to count as one
+FEATURE_SLOTS = 2          # answer sentences that name a key point, when key points exist
+FEATURE_WINDOW = 0.30      # such a sentence may score this far below the best one
 
 STOP = set("""the a an of in on for to and or is are was were be what how why when where which who
 about with web search websearch lookup look up cari carikan tentang di internet online dan yang
@@ -100,7 +102,8 @@ OPINION = re.compile(
     r"\b(?:might feel|feels? like|one of the (?:most|best)|the (?:biggest|best|worst)|exactly why|"
     r"game[- ]?changer|amazing|awesome|incredible|honestly|most important|roundups?|listicles?|"
     r"in my opinion|i think|i believe|personally|"
-    r"(?:is|was|are|were) an? (?:strong|solid|great|exciting|impressive|powerful|fantastic|excellent|remarkable))\b", re.I)
+    r"(?:is|was|are|were) an? (?:strong|solid|great|exciting|impressive|powerful|fantastic|excellent|remarkable)|"
+    r"(?:significant|major|big|huge|giant) (?:step|leap|milestone)|step forward|represents another)\b", re.I)
 ADVICE = re.compile(
     r"^(?:waiting|upgrading|migrating|updating|if you|when you|make sure|don't|do not|avoid|consider|"
     r"remember|keep|use|try|check|we (?:generally |highly |strongly )?(?:recommend|suggest|advise)|"
@@ -126,6 +129,8 @@ NAME_BAD = re.compile(
     r"review|audit|plan|prepare|decide|know|understand|choose|pick|ask|look|stay|watch|join|download)\s+"
     r"(?:on|out|up|off|your|the|a|an|to|for|what|where|how|why|if|when|all|every|any)\b|"
     r"\b(?:is|are|was|were|has|have|had|will|can|should|must)\b|n't\b|^[a-z_]\w*_\w+(?:\(\))?$", re.I)
+HL_STRONG = re.compile(r"\b(?:new|features?|highlights?|improvements?|changes?|headline)\b", re.I)
+VERSIONED = re.compile(r"^[A-Za-z][\w .+-]*?\s+v?(\d+(?:\.\d+)*)\.?$")  # "Laravel 11": a product and a version only
 CLOSING = re.compile(r"^(?:conclusions?|final thoughts|wrapping up|takeaways?|key takeaways|faq|comments?|"
                      r"related (?:posts|articles)|see also|references?|about the author|share this)\b", re.I)
 YOU = re.compile(r"\b(?:you|your|yours|you'll|you've|you're|yourself)\b", re.I)
@@ -506,7 +511,7 @@ def similarity(a, b):
     return len(wa & wb) / max(min(len(wa), len(wb)), 1)
 
 
-def select(cands):
+def select(cands, points=()):
     """Best sentence first, then the ones that add the most: score minus a share of the similarity to what
     is already chosen (maximal marginal relevance). No near duplicates, at most 2 per page."""
     pool = sorted(cands, key=lambda c: -c["score"])
@@ -531,6 +536,25 @@ def select(cands):
         chosen.append(best)
         per_src[best["src"]] = per_src.get(best["src"], 0) + 1
         pool.remove(best)
+    if points and chosen:
+        named = [c for c in chosen if mentions_point(c["text"], points)]
+        top = max(c["score"] for c in cands)
+        extra = sorted((c for c in cands if all(c is not x for x in chosen) and mentions_point(c["text"], points)
+                        and c["score"] >= top - FEATURE_WINDOW
+                        and not {"advice", "opinion", "vague", "you"} & set(c["flags"])),
+                       key=lambda c: -c["score"])
+        for c in extra:
+            if len(named) >= FEATURE_SLOTS:
+                break
+            if any(duplicate(c, x) for x in chosen) or sum(x["src"] == c["src"] for x in chosen) >= PER_SOURCE_ANSWER:
+                continue
+            if len(chosen) >= ANSWER_SENTENCES:  # make room: drop the weakest sentence that names no key point
+                spare = [x for x in chosen[1:] if all(x is not n for n in named)]
+                if not spare:
+                    break
+                chosen.remove(min(spare, key=lambda x: x["score"]))
+            chosen.append(c)
+            named.append(c)
     return chosen
 
 
@@ -559,7 +583,7 @@ def score_candidate(c, qvecs, nums, phrase, subject, today):
     if ADVICE.match(text):
         score -= ADVICE_PENALTY
         flags.append("advice")
-    if VAGUE.search(text):
+    if VAGUE.search(text) and text.count(",") < 2:  # a list of named things is specific enough
         score -= VAGUE_PENALTY
         flags.append("vague")
     if subject and subject.match(text):
@@ -583,37 +607,46 @@ def highlight_name(item):
     return name
 
 
-def page_highlights(text):
-    """Feature names of a release page: the headings below a 'New features' / 'Release' heading, or else the
-    short list items below one."""
-    heads, items, parent = [], [], 0
+def page_highlights(text, nums=()):
+    """-> (names, strong). Feature names of a release page: the headings below a 'New features' / 'Release'
+    heading, or else the short list items below one. strong: that heading itself says 'new' or 'features'."""
+    heads, items, parent, strong = [], [], 0, False
     for b in blocks(text):
         if b.startswith("#"):
             level, title = len(b) - len(b.lstrip("#")), b.lstrip("#").strip()
-            if parent and level > parent:
+            other = VERSIONED.match(title)
+            if other and nums and other.group(1) not in nums:  # a section about another version: stop collecting
+                parent = 0
+            elif parent and level > parent:
                 name = highlight_name(title)
                 if name:
                     heads.append(name)
             elif HL_HEAD.search(title):
-                parent = level
+                parent, strong = level, strong or bool(HL_STRONG.search(title))
             else:
                 parent = 0
         elif parent and b.startswith("- "):
             name = highlight_name(b[2:])
             if name:
                 items.append(name)
-    return heads if len(heads) >= 3 else items
+    return (heads if len(heads) >= 3 else items), strong
 
 
-def collect_highlights(pairs, words=()):
-    """-> [{"name", "pages": [ranks]}] for the key points several pages list, most agreed on first."""
-    lists = [(r["rank"], page_highlights(page[4])) for r, (page, _err) in pairs if page is not None]
-    lists = [(rank, names) for rank, names in lists if names]
+def collect_highlights(pairs, words=(), nums=()):
+    """-> [{"name", "pages": [ranks]}] for the key points several pages list, most agreed on first. A single
+    page is only trusted when its heading itself says 'new' or 'features'."""
+    lists = []
+    for r, (page, _err) in pairs:
+        if page is not None:
+            names, strong = page_highlights(page[4], nums)
+            if names:
+                lists.append((r["rank"], names, strong))
     groups, qwords = [], set(words)
-    for rank, names in lists:
+    for rank, names, _strong in lists:
         for name in names:
             w = content_words(name)
-            if not w or w <= qwords:  # empty, or just the query again ("Laravel 13")
+            rest = {x for x in w if not re.fullmatch(r"\d+(?:\.\d+)*", x)}
+            if not rest or rest <= qwords:  # empty, or the query's own name again ("Laravel 13")
                 continue
             for g in groups:
                 if len(w & g["words"]) / min(len(w), len(g["words"])) >= HL_MATCH:
@@ -622,13 +655,19 @@ def collect_highlights(pairs, words=()):
                     break
             else:
                 groups.append({"name": name, "words": w, "pages": [rank], "order": len(groups)})
+    if len(lists) == 1 and not lists[0][2]:
+        return []
     need = HL_MIN_PAGES if len(lists) >= HL_MIN_PAGES else 1
     keep = sorted((g for g in groups if len(g["pages"]) >= need), key=lambda g: (-len(g["pages"]), g["order"]))
-    if len(keep) < 3:  # no agreement between pages: take the longest list of the best ranked page
-        rank, names = next(((rk, nm) for rk, nm in lists if len(nm) >= 3), (None, []))
-        keep = [g for g in groups if rank in g["pages"]]
-        keep.sort(key=lambda g: g["order"])
+    if len(keep) < 3:  # no agreement between pages: the best ranked page whose heading says 'new' or 'features'
+        rank = next((rk for rk, nm, st in lists if st and len(nm) >= 3), None)
+        keep = sorted((g for g in groups if rank in g["pages"]), key=lambda g: g["order"])
     return keep[:HIGHLIGHTS] if len(keep) >= 3 else []
+
+
+def mentions_point(text, points):
+    tw = content_words(text)
+    return any(g["words"] and len(g["words"] & tw) / len(g["words"]) >= HL_MATCH for g in points)
 
 
 def print_answer(query, pairs, words, nums, phrase, strict, width):
@@ -657,7 +696,8 @@ def print_answer(query, pairs, words, nums, phrase, strict, width):
     for c in cands:
         score_candidate(c, qvecs, nums, phrase, subject, today)
 
-    chosen = select(cands)
+    points = collect_highlights(pairs, words, nums) if HL_QUERY.search(query) else []
+    chosen = select(cands, points)
     if not chosen:
         return False
 
@@ -672,7 +712,6 @@ def print_answer(query, pairs, words, nums, phrase, strict, width):
         print(textwrap.fill(line, width=width, initial_indent="- ", subsequent_indent="  ",
                             break_long_words=False, break_on_hyphens=False))
 
-    points = collect_highlights(pairs, words) if HL_QUERY.search(query) else []
     if points:
         print("\nKey points:")
         for g in points:
@@ -694,6 +733,7 @@ def print_answer(query, pairs, words, nums, phrase, strict, width):
             others = [x for x in chosen if x is not c]
             near = max((similarity(c, x) for x in others), default=0.0)
             tags = c["flags"] + (["dup"] if c not in chosen and any(duplicate(c, x) for x in others) else [])
+            tags += ["feature"] if points and mentions_point(c["text"], points) else []
             flags = f" {','.join(tags)}" if tags else ""
             print(f"{mark} {c['score']:.3f} q={c['qcos']:.3f} sup={len(c['support'])} near={near:.2f}{flags} "
                   f"[{c['src']}] {textwrap.shorten(c['text'], width=100, placeholder='...')}")
