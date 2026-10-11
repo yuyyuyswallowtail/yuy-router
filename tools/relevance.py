@@ -4,11 +4,12 @@
 rank_results   sorts search results by how well they match the query. It uses EmbeddingGemma
                through the local llama-server (the one router.py starts) and falls back to plain
                word matching when that server cannot be reached.
-show_relevant  reads the most relevant pages in parallel and prints the paragraphs that match
-               the query instead of the start of the page. Code samples, menus, and tables of
-               contents are skipped. A page that cannot be read is replaced by its search snippet.
+show_relevant  reads the most relevant pages in parallel and prints a direct answer: the sentences
+               that match the query best, picked with EmbeddingGemma (extractive, nothing is
+               generated), each tagged with the pages that say the same. With -d/--debug (or
+               YUY_DEBUG=1) the matching paragraphs of every page are printed as well.
 
-Numbers in the query ("14" in "laravel 14") must appear in a result or paragraph to count.
+Numbers in the query ("14" in "laravel 14") must appear in a result, paragraph, or sentence to count.
 """
 import functools
 import json
@@ -23,24 +24,50 @@ from concurrent.futures import ThreadPoolExecutor
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-PHRASE_BONUS = 0.10     # the query words appear next to each other, in order
-NUM_BONUS = 0.15        # every number of the query appears
-NUM_PENALTY = 0.20      # a number of the query is missing
-MIN_WORD_SHARE = 0.6    # a result must hold this share of the query words (and all numbers) to be read
-MIN_BLOCK_SHARE = 0.6   # a paragraph must hold this share of the query words to be shown
-PROSE_BONUS = 0.25      # sentences are preferred over headings
-CODE_DENSITY = 0.04     # share of code-like symbols above which a paragraph counts as a code sample
-PAGES = 3               # pages shown at most
-TRIES = 6               # candidate pages fetched (in parallel)
-FETCH_TIMEOUT = 10      # seconds per page
-EXCERPTS = 3            # paragraphs shown per page (at most one of them a heading)
-EXCERPT_CHARS = 500     # characters per paragraph
+PHRASE_BONUS = 0.10        # the query words appear next to each other, in order
+NUM_BONUS = 0.15           # every number of the query appears
+NUM_PENALTY = 0.20         # a number of the query is missing
+MIN_WORD_SHARE = 0.6       # a result must hold this share of the query words (and all numbers) to be read
+MIN_BLOCK_SHARE = 0.6      # a paragraph must hold this share of the query words to be shown
+PROSE_BONUS = 0.25         # sentences are preferred over headings
+CODE_DENSITY = 0.04        # share of code-like symbols above which a paragraph counts as a code sample
+TRIES = 6                  # candidate pages fetched (in parallel)
+PAGES = 3                  # pages shown at most in the debug view
+FETCH_TIMEOUT = 10         # seconds per page
+EXCERPTS = 3               # paragraphs shown per page in the debug view (at most one a heading)
+EXCERPT_CHARS = 500        # characters per paragraph in the debug view
+
+ANSWER_SENTENCES = 4       # sentences in the answer at most
+ANSWER_WINDOW = 0.12       # only sentences within this score distance of the best one
+PER_SOURCE_ANSWER = 2      # sentences per page at most
+SENTENCES_PER_PAGE = 12    # candidate sentences per page that get embedded
+AGREE = 0.82               # cosine above which sentences from two pages say the same thing
+DUP = 0.92                 # cosine above which two sentences are near duplicates
+CONSENSUS_BONUS = 0.08     # score bonus when other pages agree (two pages count at most)
+SENT_PHRASE_BONUS = 0.05   # the sentence holds the query words next to each other
 
 STOP = set("""the a an of in on for to and or is are was were be what how why when where which who
 about with web search websearch lookup look up cari carikan tentang di internet online dan yang
 apa itu untuk dari""".split())
 TOKEN = re.compile(r"\w+(?:\.\w+)*")
 CODE_CHARS = set("$;{}<>[]=\\|`")
+SENT_SPLIT = re.compile(r'(?<=[.!?])\s+(?=[A-Z0-9"“(\[])')
+BOILER = re.compile(
+    r"\b(cookies?|subscribe|newsletter|sign up|log in|privacy policy|terms of (?:use|service)|"
+    r"all rights reserved|follow us|share this|read more|advertisement|click here|table of contents)\b",
+    re.I)
+
+
+def debug_on():
+    """True for yuy -d/--debug (read from the router's command line) or YUY_DEBUG=1."""
+    if os.environ.get("YUY_DEBUG"):
+        return True
+    try:
+        with open(f"/proc/{os.getppid()}/cmdline", "rb") as f:
+            args = f.read().decode(errors="replace").split("\0")
+    except OSError:
+        return False
+    return any(a in ("-d", "--debug") for a in args[1:])
 
 
 # ---------------------------------------------------------------- words and numbers
@@ -104,6 +131,17 @@ def embed(texts, timeout=20):
     return out
 
 
+def embed_many(texts, chunk=32):
+    out = []
+    for i in range(0, len(texts), chunk):
+        out.extend(embed(texts[i:i + chunk], timeout=60))
+    return out
+
+
+def dot(a, b):
+    return sum(x * y for x, y in zip(a, b))
+
+
 def doc_text(r):
     return f"title: {' '.join(r['title'].split())} | text: {' '.join(r['snippet'].split())[:400]}"
 
@@ -118,7 +156,7 @@ def rank_results(query, results):
     if results:
         try:
             vecs = embed([f"task: search result | query: {query}"] + [doc_text(r) for r in results])
-            cos = [sum(a * b for a, b in zip(vecs[0], v)) for v in vecs[1:]]
+            cos = [dot(vecs[0], v) for v in vecs[1:]]
             method = "EmbeddingGemma"
         except (urllib.error.URLError, OSError, KeyError, ValueError, IndexError):
             method = "word match, embedding server not reachable"
@@ -141,7 +179,7 @@ def rank_results(query, results):
     return ranked, method
 
 
-# ---------------------------------------------------------------- excerpts
+# ---------------------------------------------------------------- paragraphs and sentences
 
 def blocks(text):
     """Paragraphs and single list items of a page text, each as one line."""
@@ -164,10 +202,12 @@ def blocks(text):
 
 
 def looks_like_noise(b):
-    """Code samples and tables of contents are not worth showing as excerpts."""
+    """Code samples, command lines, comment-thread headers, and tables of contents are not worth showing."""
     if b.startswith("#"):  # headings are fine
         return False
-    if b.count("#") >= 3:  # "Table of contents # New Features# Breaking Changes# ..."
+    if b.count("#") >= 3 or b.count("|") >= 3:
+        return True
+    if len(re.findall(r"(?:^|\s)--?[a-z][\w-]*", b)) >= 3:  # command-line flags
         return True
     symbols = sum(1 for ch in b if ch in CODE_CHARS)
     return symbols / len(b) > CODE_DENSITY
@@ -217,6 +257,141 @@ def excerpts(text, words, nums, phrase, strict):
     return [window(b, focus, EXCERPT_CHARS) for _, b in sorted(picked)]
 
 
+def page_sentences(text):
+    """Complete sentences of a page, without headings, code, menus, questions, and boilerplate."""
+    out = []
+    for b in blocks(text):
+        if b.startswith("#") or looks_like_noise(b):
+            continue
+        if b.startswith("- "):
+            b = b[2:]
+        for s in SENT_SPLIT.split(b):
+            s = s.strip()
+            if (40 <= len(s) <= 420 and not s.endswith("?") and not BOILER.search(s)
+                    and not looks_like_noise(s)):
+                out.append(s)
+    return out
+
+
+def snippet_sentence(snippet):
+    """The search snippet as one sentence (for pages that could not be read), without its date prefix."""
+    s = " ".join(snippet.split())
+    s = re.sub(r"^[A-Z][a-z]{2} \d{1,2}, \d{4}\s*(?:\.{2,}|…)?\s*", "", s)
+    s = re.sub(r"\s+([,.;:!?])", r"\1", s).strip()
+    return s if len(s) >= 40 and not BOILER.search(s) else ""
+
+
+# ---------------------------------------------------------------- the answer
+
+def lexical(s, words, phrase):
+    hits = sum(1 for w in words if has(s, w))
+    return hits / max(len(words), 1) + (0.5 if phrase and phrase.search(s) else 0.0), hits
+
+
+def build_candidates(pairs, words, nums, phrase, strict):
+    """Sentences worth embedding: they hold the query numbers and at least half of the query words."""
+    need_hits = math.ceil(len(words) * 0.5 - 1e-9) if words else 0
+    plain = [w for w in words if w not in nums]
+    cands, seen = [], set()
+    for r, (page, _err) in pairs:
+        if page is not None:
+            pool = page_sentences(page[4])
+        else:
+            one = snippet_sentence(r["snippet"])
+            pool = [one] if one else []
+        scored = []
+        for s in pool:
+            score, hits = lexical(s, words, phrase)
+            if hits < need_hits or (plain and not any(has(s, w) for w in plain)):
+                continue
+            if strict and not all(has(s, n) for n in nums):
+                continue
+            scored.append((score, s))
+        scored.sort(key=lambda x: -x[0])
+        for score, s in scored[:SENTENCES_PER_PAGE]:
+            if s.lower() in seen:
+                continue
+            seen.add(s.lower())
+            cands.append({"text": s, "src": r["rank"], "lex": score})
+    return cands
+
+
+def agree(a, b):
+    return bool(a.get("vec") and b.get("vec")) and dot(a["vec"], b["vec"]) >= AGREE
+
+
+def duplicate(a, b):
+    if a.get("vec") and b.get("vec"):
+        return dot(a["vec"], b["vec"]) >= DUP
+    wa, wb = set(TOKEN.findall(a["text"].lower())), set(TOKEN.findall(b["text"].lower()))
+    return bool(wa and wb) and len(wa & wb) / len(wa | wb) >= 0.6
+
+
+def select(cands):
+    """Best sentences first: close to the top score, no near duplicates, at most 2 per page."""
+    pool = sorted(cands, key=lambda c: -c["score"])
+    if not pool:
+        return []
+    top = pool[0]["score"]
+    chosen, per_src = [], {}
+    for c in pool:
+        if len(chosen) == ANSWER_SENTENCES:
+            break
+        if c["score"] < top - ANSWER_WINDOW or per_src.get(c["src"], 0) >= PER_SOURCE_ANSWER:
+            continue
+        if any(duplicate(c, s) for s in chosen):
+            continue
+        chosen.append(c)
+        per_src[c["src"]] = per_src.get(c["src"], 0) + 1
+    return chosen
+
+
+def print_answer(query, pairs, words, nums, phrase, strict, width):
+    """Print the direct answer. -> False when no sentence qualified."""
+    cands = build_candidates(pairs, words, nums, phrase, strict)
+    if not cands:
+        return False
+    qvec = None
+    try:
+        vecs = embed_many([f"task: search result | query: {query}"]
+                          + [f"title: none | text: {c['text']}" for c in cands])
+        qvec = vecs[0]
+        for c, v in zip(cands, vecs[1:]):
+            c["vec"] = v
+    except (urllib.error.URLError, OSError, KeyError, ValueError, IndexError):
+        pass
+
+    for c in cands:
+        base = dot(qvec, c["vec"]) if qvec else c["lex"]
+        c["support"] = sorted({o["src"] for o in cands if o["src"] != c["src"] and agree(c, o)})
+        c["score"] = (base + (SENT_PHRASE_BONUS if phrase and phrase.search(c["text"]) else 0.0)
+                      + CONSENSUS_BONUS * min(len(c["support"]), 2) / 2)
+
+    chosen = select(cands)
+    if not chosen:
+        return False
+
+    print(f"\n== Answer: {query} ==")
+    if qvec is None:
+        print("(embedding server not reachable: sentences picked by word match only)")
+    used = set()
+    for c in chosen:
+        tags = sorted({c["src"], *c["support"]})
+        used.update(tags)
+        line = c["text"] + " " + "".join(f"[{t}]" for t in tags)
+        print(textwrap.fill(line, width=width, initial_indent="- ", subsequent_indent="  ",
+                            break_long_words=False, break_on_hyphens=False))
+
+    print("\nSources:")
+    by_rank = {r["rank"]: r for r, _ in pairs}
+    for t in sorted(used):
+        r = by_rank.get(t)
+        if r:
+            title = textwrap.shorten(" ".join(r["title"].split()), width=80, placeholder="...")
+            print(f"[{t}] {title} ({host_of(r['url'])})\n    {r['url']}")
+    return True
+
+
 # ---------------------------------------------------------------- output
 
 def host_of(url):
@@ -246,25 +421,11 @@ def bullet(text, width):
                          break_long_words=False, break_on_hyphens=False)
 
 
-def show_relevant(query, results, fetch_page, fetch_error, width):
-    """Read the most relevant results and print the paragraphs that match the query."""
-    words, nums = query_terms(query)
-    phrase = phrase_re(words)
-    strict = True
-    candidates = [r for r in results if r.get("relevant")]
-    if not candidates:
-        strict = False
-        candidates = results[:3]
-        print(f'\nNo result clearly mentions every part of "{query}". Showing the closest ones.')
-    candidates = candidates[:TRIES]
-    if not candidates:
-        print("\nNo results to read.")
-        return
-
-    fetched = fetch_all([r["url"] for r in candidates], fetch_page, fetch_error)
+def print_excerpts(pairs, words, nums, phrase, strict, width):
+    """Debug view: the matching paragraphs of every page."""
     print("\n== Relevant pages ==")
     shown, skipped = 0, []
-    for r, (page, err) in zip(candidates, fetched):
+    for r, (page, err) in pairs:
         if shown >= PAGES:
             break
         title = textwrap.shorten(" ".join(r["title"].split()), width=90, placeholder="...")
@@ -289,3 +450,26 @@ def show_relevant(query, results, fetch_page, fetch_error, width):
         print('\nNo readable page matched. Read one yourself: yuy "fetch <url>"')
     elif skipped:
         print(f"\n(not shown, no matching paragraph: {', '.join(skipped)})")
+
+
+def show_relevant(query, results, fetch_page, fetch_error, width):
+    """Read the most relevant results and print a direct answer (plus the matching paragraphs with -d)."""
+    words, nums = query_terms(query)
+    phrase = phrase_re(words)
+    strict = True
+    candidates = [r for r in results if r.get("relevant")]
+    if not candidates:
+        strict = False
+        candidates = results[:3]
+        print(f'\nNo result clearly mentions every part of "{query}". Showing the closest ones.')
+    candidates = candidates[:TRIES]
+    if not candidates:
+        print("\nNo results to read.")
+        return
+
+    pairs = list(zip(candidates, fetch_all([r["url"] for r in candidates], fetch_page, fetch_error)))
+    answered = print_answer(query, pairs, words, nums, phrase, strict, width)
+    if debug_on() or not answered:
+        if not answered:
+            print("\nNo direct answer could be put together; showing the matching paragraphs instead.")
+        print_excerpts(pairs, words, nums, phrase, strict, width)

@@ -754,11 +754,12 @@ def do_websearch(s):
             f'\nOpen it yourself: yuy "open {bing} in browser"')
     results, method = relevance.rank_results(query, results)
     print(f"== Web search ({engine}): {query} ==")
-    print(f"Ranked by relevance ({method}).")
+    if relevance.debug_on():
+        print(f"Ranked by relevance ({method}).")
     if notes:
         print("Note: " + "; ".join(notes))
     width = term_width()
-    for i, r in enumerate(results[:MAX_RESULTS], 1):
+    for i, r in enumerate(results[:MAX_RESULTS] if relevance.debug_on() else [], 1):
         print(f"\n{i}. {' '.join(r['title'].split())}")
         print(f"   {r['url']}")
         snippet = re.sub(r"\s+([,.;:!?])", r"\1", " ".join(r["snippet"].split()))
