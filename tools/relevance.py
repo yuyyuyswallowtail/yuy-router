@@ -63,6 +63,11 @@ YOU_PENALTY = 0.05         # "you/your" voice (tutorials, marketing)
 STALE_PENALTY = 0.15       # a forecast ("expected", "scheduled", ...) whose dates are all in the past
 OPINION_PENALTY = 0.08     # evaluative language instead of facts
 ADVICE_PENALTY = 0.08      # advice and instructions instead of facts
+VAGUE_PENALTY = 0.10       # "a number of new features": says nothing a name or a number would
+MMR_WEIGHT = 0.30          # a sentence loses this much times its similarity to the ones already chosen
+HIGHLIGHTS = 8             # key points listed at most
+HL_MIN_PAGES = 2           # a key point must be listed by this many pages (when that many pages have a list)
+HL_MATCH = 0.75            # share of content words two key point names must have in common to count as one
 
 STOP = set("""the a an of in on for to and or is are was were be what how why when where which who
 about with web search websearch lookup look up cari carikan tentang di internet online dan yang
@@ -92,10 +97,26 @@ META = re.compile(
 OPINION = re.compile(
     r"\b(?:might feel|feels? like|one of the (?:most|best)|the (?:biggest|best|worst)|exactly why|"
     r"game[- ]?changer|amazing|awesome|incredible|honestly|most important|roundups?|listicles?|"
-    r"in my opinion|i think|i believe|personally)\b", re.I)
+    r"in my opinion|i think|i believe|personally|"
+    r"(?:is|was|are|were) an? (?:strong|solid|great|exciting|impressive|powerful|fantastic|excellent|remarkable))\b", re.I)
 ADVICE = re.compile(
     r"^(?:waiting|upgrading|migrating|updating|if you|when you|make sure|don't|do not|avoid|consider|"
     r"remember|keep|use|try|check)\b", re.I)
+VAGUE = re.compile(
+    r"\b(?:a (?:number|variety|range|host|couple|lot) of|several|various|numerous|"
+    r"(?:new )?features and (?:improvements|changes|enhancements)|"
+    r"(?:aim(?:s|ing)|designed) to (?:simplify|improve|make|enhance))\b", re.I)
+REF_MARK = re.compile(r"\s*\[(?:\d+|[a-z]|citation needed|edit)\]")  # footnote marks that would look like our [1][2] tags
+HL_QUERY = re.compile(r"\b(?:new|features?|released?|changes?|changelog|updates?|upgrad\w*|version|highlights|"
+                      r"improvements)\b|\d", re.I)
+HL_HEAD = re.compile(r"\b(?:new|features?|highlights?|improvements?|changes?|added|introduc\w*|headline|releases?|"
+                     r"announce\w*)\b", re.I)
+HL_JUNK = re.compile(r"^(?:download|install\w*|contribut\w*|related|summary|conclusion|introduction|overview|faq|"
+                     r"comments?|share|references?|see also|resources?|about|changelog|credits|sponsors?|"
+                     r"final thoughts|upgrad\w+|migration|wrapping up|key takeaways|table of contents|what'?s next|"
+                     r"getting started|support|requirements?|more)\b", re.I)
+CLOSING = re.compile(r"^(?:conclusions?|final thoughts|wrapping up|takeaways?|key takeaways|faq|comments?|"
+                     r"related (?:posts|articles)|see also|references?|about the author|share this)\b", re.I)
 YOU = re.compile(r"\b(?:you|your|yours|you'll|you've|you're|yourself)\b", re.I)
 
 MONTHS = {m: i for i, m in enumerate("jan feb mar apr may jun jul aug sep oct nov dec".split(), 1)}
@@ -336,9 +357,13 @@ def good_sentence(s):
 
 def page_sentences(text):
     """Self-contained sentences of a page, without headings, code, menus, questions, and boilerplate."""
-    out = []
+    out, closing = [], False
     for b in blocks(text):
-        if b.startswith("#") or looks_like_noise(b):
+        b = REF_MARK.sub("", b)
+        if b.startswith("#"):
+            closing = bool(CLOSING.match(b.lstrip("#").strip()))
+            continue
+        if closing or looks_like_noise(b):
             continue
         if b.startswith("- "):
             b = b[2:]
@@ -458,22 +483,33 @@ def duplicate(a, b):
     return bool(a.get("vec") and b.get("vec")) and dot(a["vec"], b["vec"]) >= DUP
 
 
+def similarity(a, b):
+    """Cosine of two candidate sentences, or their content-word overlap when there are no embeddings."""
+    if a.get("vec") and b.get("vec"):
+        return dot(a["vec"], b["vec"])
+    wa, wb = content_words(a["text"]), content_words(b["text"])
+    return len(wa & wb) / max(min(len(wa), len(wb)), 1)
+
+
 def select(cands):
-    """Best sentences first: close to the top score, no near duplicates, at most 2 per page."""
+    """Best sentence first, then the ones that add the most: score minus a share of the similarity to what
+    is already chosen (maximal marginal relevance). No near duplicates, at most 2 per page."""
     pool = sorted(cands, key=lambda c: -c["score"])
     if not pool:
         return []
     top = pool[0]["score"]
+    pool = [c for c in pool if c["score"] >= top - ANSWER_WINDOW]
     chosen, per_src = [], {}
-    for c in pool:
-        if len(chosen) == ANSWER_SENTENCES:
+    while pool and len(chosen) < ANSWER_SENTENCES:
+        pool = [c for c in pool if per_src.get(c["src"], 0) < PER_SOURCE_ANSWER
+                and not any(duplicate(c, x) for x in chosen)]
+        if not pool:
             break
-        if c["score"] < top - ANSWER_WINDOW or per_src.get(c["src"], 0) >= PER_SOURCE_ANSWER:
-            continue
-        if any(duplicate(c, s) for s in chosen):
-            continue
-        chosen.append(c)
-        per_src[c["src"]] = per_src.get(c["src"], 0) + 1
+        best = max(pool, key=lambda c: c["score"] - MMR_WEIGHT * max(
+            (similarity(c, x) for x in chosen), default=0.0))
+        chosen.append(best)
+        per_src[best["src"]] = per_src.get(best["src"], 0) + 1
+        pool.remove(best)
     return chosen
 
 
@@ -501,6 +537,9 @@ def score_candidate(c, qvecs, nums, phrase, subject, today):
     if ADVICE.match(text):
         score -= ADVICE_PENALTY
         flags.append("advice")
+    if VAGUE.search(text):
+        score -= VAGUE_PENALTY
+        flags.append("vague")
     if subject and subject.match(text):
         score += SUBJECT_BONUS
         flags.append("subject")
@@ -508,6 +547,65 @@ def score_candidate(c, qvecs, nums, phrase, subject, today):
         score += LEAD_BONUS
         flags.append("lead")
     c["qcos"], c["flags"], c["score"] = qcos, flags, score
+
+
+def highlight_name(item):
+    """'Property hooks: define get and set logic ...' -> 'Property hooks'. '' when it is a sentence or page chrome."""
+    name = re.split(r"\s+[—–-]\s+|:\s|\s\(|;\s", item.strip(), maxsplit=1)[0]
+    name = re.sub(r"^(?:\d+[.)]\s*|new:?\s+)", "", name, flags=re.I).strip(" .,;:*`\"'#")
+    if not 4 <= len(name) <= 60 or len(name.split()) > 7 or name.endswith("?"):
+        return ""
+    if HL_JUNK.match(name) or BOILER.search(name) or looks_like_noise(name):
+        return ""
+    return name
+
+
+def page_highlights(text):
+    """Feature names of a release page: the headings below a 'New features' / 'Release' heading, or else the
+    short list items below one."""
+    heads, items, parent = [], [], 0
+    for b in blocks(text):
+        if b.startswith("#"):
+            level, title = len(b) - len(b.lstrip("#")), b.lstrip("#").strip()
+            if parent and level > parent:
+                name = highlight_name(title)
+                if name:
+                    heads.append(name)
+            elif HL_HEAD.search(title):
+                parent = level
+            else:
+                parent = 0
+        elif parent and b.startswith("- "):
+            name = highlight_name(b[2:])
+            if name:
+                items.append(name)
+    return heads if len(heads) >= 3 else items
+
+
+def collect_highlights(pairs):
+    """-> [{"name", "pages": [ranks]}] for the key points several pages list, most agreed on first."""
+    lists = [(r["rank"], page_highlights(page[4])) for r, (page, _err) in pairs if page is not None]
+    lists = [(rank, names) for rank, names in lists if names]
+    groups = []
+    for rank, names in lists:
+        for name in names:
+            w = content_words(name)
+            if not w:
+                continue
+            for g in groups:
+                if len(w & g["words"]) / min(len(w), len(g["words"])) >= HL_MATCH:
+                    if rank not in g["pages"]:
+                        g["pages"].append(rank)
+                    break
+            else:
+                groups.append({"name": name, "words": w, "pages": [rank], "order": len(groups)})
+    need = HL_MIN_PAGES if len(lists) >= HL_MIN_PAGES else 1
+    keep = sorted((g for g in groups if len(g["pages"]) >= need), key=lambda g: (-len(g["pages"]), g["order"]))
+    if len(keep) < 3:  # no agreement between pages: take the longest list of the best ranked page
+        rank, names = next(((rk, nm) for rk, nm in lists if len(nm) >= 3), (None, []))
+        keep = [g for g in groups if rank in g["pages"]]
+        keep.sort(key=lambda g: g["order"])
+    return keep[:HIGHLIGHTS] if len(keep) >= 3 else []
 
 
 def print_answer(query, pairs, words, nums, phrase, strict, width):
@@ -550,6 +648,13 @@ def print_answer(query, pairs, words, nums, phrase, strict, width):
         line = c["text"] + " " + "".join(f"[{t}]" for t in tags)
         print(textwrap.fill(line, width=width, initial_indent="- ", subsequent_indent="  ",
                             break_long_words=False, break_on_hyphens=False))
+
+    points = collect_highlights(pairs) if HL_QUERY.search(query) else []
+    if points:
+        print("\nKey points:")
+        for g in points:
+            used.update(g["pages"])
+            print(f"- {g['name']} " + "".join(f"[{t}]" for t in sorted(g["pages"])))
 
     print("\nSources:")
     by_rank = {r["rank"]: r for r, _ in pairs}
