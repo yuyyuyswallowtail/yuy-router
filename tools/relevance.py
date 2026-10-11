@@ -50,7 +50,8 @@ MIN_SENT_WORDS = 6
 AGREE_FLOOR = 0.85         # sentences from two pages agree only above this cosine ...
 AGREE_PERCENTILE = 0.95    # ... and above this percentile of all cross-page sentence pairs
 MAX_SUPPORT = 3            # pages named as support for one sentence at most
-DUP = 0.88                 # cosine above which two sentences are near duplicates
+DUP = 0.88                 # cosine above which two sentences that state the same number are the same fact
+DUP_SURE = 0.95            # cosine above which two sentences are near duplicates whatever they say
 CONTAIN = 0.70             # share of the shorter sentence's content words found in a chosen one
 CONSENSUS_BONUS = 0.08     # score bonus when other pages agree (two pages count at most)
 SENT_PHRASE_BONUS = 0.05   # the sentence holds the query words next to each other
@@ -91,9 +92,10 @@ ANAPHORA = re.compile(
     r"none|nothing|whatever|anything|everything|otherwise|instead|thus|therefore|meanwhile)\b", re.I)
 # sentences that describe the article instead of stating a fact
 META = re.compile(
-    r"^(?:what (?:is|are|we|you)\b|here(?:'s| is| are)\b|in this (?:article|post|guide|video|tutorial)\b|"
+    r"^(?:what (?:is|are|we|you)\b|here(?:'s| is| are)\b|in this (?:article|post|blog|guide|video|tutorial|section|series)\b|"
     r"this (?:article|post|guide|video|tutorial)\b|everything you\b|learn\b|discover\b|find out\b|"
-    r"read on\b|let's\b|let me\b|welcome\b|introduction\b)", re.I)
+    r"read on\b|let's\b|let me\b|welcome\b|introduction\b|see (?:the|our|this|below|above|also)\b|"
+    r"(?:in|on) (?:the )?(?:table|list) below\b)", re.I)
 OPINION = re.compile(
     r"\b(?:might feel|feels? like|one of the (?:most|best)|the (?:biggest|best|worst)|exactly why|"
     r"game[- ]?changer|amazing|awesome|incredible|honestly|most important|roundups?|listicles?|"
@@ -101,11 +103,14 @@ OPINION = re.compile(
     r"(?:is|was|are|were) an? (?:strong|solid|great|exciting|impressive|powerful|fantastic|excellent|remarkable))\b", re.I)
 ADVICE = re.compile(
     r"^(?:waiting|upgrading|migrating|updating|if you|when you|make sure|don't|do not|avoid|consider|"
-    r"remember|keep|use|try|check)\b", re.I)
+    r"remember|keep|use|try|check|we (?:generally |highly |strongly )?(?:recommend|suggest|advise)|"
+    r"it(?:'s| is) recommended|visit|click|download|refer to)\b", re.I)
 VAGUE = re.compile(
     r"\b(?:a (?:number|variety|range|host|couple|lot) of|several|various|numerous|"
     r"(?:new )?features and (?:improvements|changes|enhancements)|"
-    r"(?:aim(?:s|ing)|designed) to (?:simplify|improve|make|enhance))\b", re.I)
+    r"(?:aim(?:s|ing)|designed) to (?:simplify|improve|make|enhance)|"
+    r"has (?:officially )?arrived|(?:are|is) (?:now )?considering|(?:across|around) the (?:globe|world)|"
+    r"when or if|what you need to know|get ready)\b", re.I)
 REF_MARK = re.compile(r"\s*\[(?:\d+|[a-z]|citation needed|edit)\]")  # footnote marks that would look like our [1][2] tags
 HL_QUERY = re.compile(r"\b(?:new|features?|released?|changes?|changelog|updates?|upgrad\w*|version|highlights|"
                       r"improvements)\b|\d", re.I)
@@ -115,6 +120,12 @@ HL_JUNK = re.compile(r"^(?:download|install\w*|contribut\w*|related|summary|conc
                      r"comments?|share|references?|see also|resources?|about|changelog|credits|sponsors?|"
                      r"final thoughts|upgrad\w+|migration|wrapping up|key takeaways|table of contents|what'?s next|"
                      r"getting started|support|requirements?|more)\b", re.I)
+NAME_BAD = re.compile(
+    r"^(?:find|see|turn|get|test|run|make|read|start|stop|set|add|enable|disable|install|update|upgrade|migrate|"
+    r"check|use|try|keep|avoid|consider|remember|learn|build|create|write|open|click|follow|take|go|let|wait|"
+    r"review|audit|plan|prepare|decide|know|understand|choose|pick|ask|look|stay|watch|join|download)\s+"
+    r"(?:on|out|up|off|your|the|a|an|to|for|what|where|how|why|if|when|all|every|any)\b|"
+    r"\b(?:is|are|was|were|has|have|had|will|can|should|must)\b|n't\b|^[a-z_]\w*_\w+(?:\(\))?$", re.I)
 CLOSING = re.compile(r"^(?:conclusions?|final thoughts|wrapping up|takeaways?|key takeaways|faq|comments?|"
                      r"related (?:posts|articles)|see also|references?|about the author|share this)\b", re.I)
 YOU = re.compile(r"\b(?:you|your|yours|you'll|you've|you're|yourself)\b", re.I)
@@ -476,11 +487,15 @@ def content_words(text):
 
 
 def duplicate(a, b):
-    """Near duplicates: most content words of the shorter sentence are in the other, or the cosine is high."""
+    """Near duplicates: most content words of the shorter sentence are in the other, or the cosine is very high,
+    or the cosine is high and both state the same number (a date, a version)."""
     wa, wb = content_words(a["text"]), content_words(b["text"])
     if wa and wb and len(wa & wb) / min(len(wa), len(wb)) >= CONTAIN:
         return True
-    return bool(a.get("vec") and b.get("vec")) and dot(a["vec"], b["vec"]) >= DUP
+    if not (a.get("vec") and b.get("vec")):
+        return False
+    cos = dot(a["vec"], b["vec"])
+    return cos >= DUP_SURE or (cos >= DUP and bool(a.get("facts", set()) & b.get("facts", set())))
 
 
 def similarity(a, b):
@@ -499,14 +514,20 @@ def select(cands):
         return []
     top = pool[0]["score"]
     pool = [c for c in pool if c["score"] >= top - ANSWER_WINDOW]
+    sims = sorted(similarity(x, y) for i, x in enumerate(pool) for y in pool[i + 1:])
+    base = sims[len(sims) // 2] if sims else 0.0  # a typical pair: only similarity above it costs points
+
+    def penalty(c):
+        worst = max((similarity(c, x) for x in chosen), default=0.0)
+        return MMR_WEIGHT * max(0.0, worst - base) / max(1.0 - base, 0.05)
+
     chosen, per_src = [], {}
     while pool and len(chosen) < ANSWER_SENTENCES:
         pool = [c for c in pool if per_src.get(c["src"], 0) < PER_SOURCE_ANSWER
                 and not any(duplicate(c, x) for x in chosen)]
         if not pool:
             break
-        best = max(pool, key=lambda c: c["score"] - MMR_WEIGHT * max(
-            (similarity(c, x) for x in chosen), default=0.0))
+        best = max(pool, key=lambda c: c["score"] - penalty(c))
         chosen.append(best)
         per_src[best["src"]] = per_src.get(best["src"], 0) + 1
         pool.remove(best)
@@ -518,6 +539,7 @@ def score_candidate(c, qvecs, nums, phrase, subject, today):
     text = c["text"]
     qcos = sum(dot(q, c["vec"]) for q in qvecs) / len(qvecs) if qvecs else c["lex"]
     facts = [t for t in re.findall(r"\d+(?:\.\d+)*", text) if t not in nums]
+    c["facts"] = set(facts)
     flags = []
     score = qcos
     if phrase and phrase.search(text):
@@ -555,7 +577,8 @@ def highlight_name(item):
     name = re.sub(r"^(?:\d+[.)]\s*|new:?\s+)", "", name, flags=re.I).strip(" .,;:*`\"'#")
     if not 4 <= len(name) <= 60 or len(name.split()) > 7 or name.endswith("?"):
         return ""
-    if HL_JUNK.match(name) or BOILER.search(name) or looks_like_noise(name):
+    if HL_JUNK.match(name) or NAME_BAD.search(name) or YOU.search(name) or BOILER.search(name) \
+            or looks_like_noise(name):
         return ""
     return name
 
@@ -582,15 +605,15 @@ def page_highlights(text):
     return heads if len(heads) >= 3 else items
 
 
-def collect_highlights(pairs):
+def collect_highlights(pairs, words=()):
     """-> [{"name", "pages": [ranks]}] for the key points several pages list, most agreed on first."""
     lists = [(r["rank"], page_highlights(page[4])) for r, (page, _err) in pairs if page is not None]
     lists = [(rank, names) for rank, names in lists if names]
-    groups = []
+    groups, qwords = [], set(words)
     for rank, names in lists:
         for name in names:
             w = content_words(name)
-            if not w:
+            if not w or w <= qwords:  # empty, or just the query again ("Laravel 13")
                 continue
             for g in groups:
                 if len(w & g["words"]) / min(len(w), len(g["words"])) >= HL_MATCH:
@@ -649,7 +672,7 @@ def print_answer(query, pairs, words, nums, phrase, strict, width):
         print(textwrap.fill(line, width=width, initial_indent="- ", subsequent_indent="  ",
                             break_long_words=False, break_on_hyphens=False))
 
-    points = collect_highlights(pairs) if HL_QUERY.search(query) else []
+    points = collect_highlights(pairs, words) if HL_QUERY.search(query) else []
     if points:
         print("\nKey points:")
         for g in points:
@@ -668,8 +691,11 @@ def print_answer(query, pairs, words, nums, phrase, strict, width):
         print("\n== Answer candidates (debug): score, query cosine, supporting pages, flags, page, sentence ==")
         for c in sorted(cands, key=lambda c: -c["score"])[:10]:
             mark = "*" if c in chosen else " "
-            flags = f" {','.join(c['flags'])}" if c["flags"] else ""
-            print(f"{mark} {c['score']:.3f} q={c['qcos']:.3f} sup={len(c['support'])}{flags} "
+            others = [x for x in chosen if x is not c]
+            near = max((similarity(c, x) for x in others), default=0.0)
+            tags = c["flags"] + (["dup"] if c not in chosen and any(duplicate(c, x) for x in others) else [])
+            flags = f" {','.join(tags)}" if tags else ""
+            print(f"{mark} {c['score']:.3f} q={c['qcos']:.3f} sup={len(c['support'])} near={near:.2f}{flags} "
                   f"[{c['src']}] {textwrap.shorten(c['text'], width=100, placeholder='...')}")
         if threshold is not None:
             print(f"(agreement threshold {threshold:.3f}, {len(cands)} candidate sentences)")
