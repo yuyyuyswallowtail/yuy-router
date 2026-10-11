@@ -408,7 +408,23 @@ def tidy(raw):
             seen.add(line)
         lines.append(textwrap.fill(line, width=width, break_long_words=False, break_on_hyphens=False,
                                    subsequent_indent="  " if line.startswith("- ") else ""))
-    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+    out, run = [], []
+
+    def flush():
+        if len(run) >= 10 and all(len(x) <= 32 for x in run):
+            out.append(f"({len(run)} short list items omitted)")
+        else:
+            out.extend(run)
+        run.clear()
+
+    for ln in lines:
+        if ln.startswith("- "):
+            run.append(ln)
+        else:
+            flush()
+            out.append(ln)
+    flush()
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
 
 
 def html_to_text(html):
@@ -731,7 +747,9 @@ def do_websearch(s):
         notes.append(f"{name}: no results that match the query")
     if not results:
         bing = "https://www.bing.com/search?" + urllib.parse.urlencode({"q": query})
+        down = any(n.startswith("SearXNG") and "refused" in n for n in notes)
         die("No usable web results.\n" + "\n".join(f"  {n}" for n in notes) +
+            ("\nSearXNG is not running. Start it with: docker start searxng" if down else "") +
             f'\nOpen it yourself: yuy "open {bing} in browser"')
     print(f"== Web search ({engine}): {query} ==")
     if notes:
