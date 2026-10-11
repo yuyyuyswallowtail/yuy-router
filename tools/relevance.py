@@ -76,7 +76,9 @@ CUT_END = re.compile(r"(?:\.{2,}|…)$")
 FLUFF_SPLIT = re.compile(r"\s[—–]\s")
 BOILER = re.compile(
     r"\b(cookies?|subscribe|newsletter|sign up|log in|privacy policy|terms of (?:use|service)|"
-    r"all rights reserved|follow us|share this|read more|advertisement|click here|table of contents)\b",
+    r"all rights reserved|follow us|share this|read more|advertisement|click here|table of contents|"
+    r"this (?:post|article|page|guide)|as (?:they|it) (?:are|is) announced|stay tuned|"
+    r"(?:that|this) (?:situation|issue|problem|approach)|as (?:mentioned|discussed|noted|described|shown) (?:above|earlier|before)|the (?:above|former|latter))\b",
     re.I)
 # sentences that start like this only make sense with the sentence before them
 ANAPHORA = re.compile(
