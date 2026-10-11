@@ -32,6 +32,7 @@ import urllib.parse
 import urllib.request
 from html import unescape
 from html.parser import HTMLParser
+import relevance
 
 HOME = os.path.realpath(os.path.expanduser("~"))
 TRASH = os.path.join(HOME, ".local", "share", "yuy-trash")
@@ -751,26 +752,20 @@ def do_websearch(s):
         die("No usable web results.\n" + "\n".join(f"  {n}" for n in notes) +
             ("\nSearXNG is not running. Start it with: docker start searxng" if down else "") +
             f'\nOpen it yourself: yuy "open {bing} in browser"')
+    results, method = relevance.rank_results(query, results)
     print(f"== Web search ({engine}): {query} ==")
+    if relevance.debug_on():
+        print(f"Ranked by relevance ({method}).")
     if notes:
         print("Note: " + "; ".join(notes))
     width = term_width()
-    for i, r in enumerate(results[:MAX_RESULTS], 1):
+    for i, r in enumerate(results[:MAX_RESULTS] if relevance.debug_on() else [], 1):
         print(f"\n{i}. {' '.join(r['title'].split())}")
         print(f"   {r['url']}")
         snippet = re.sub(r"\s+([,.;:!?])", r"\1", " ".join(r["snippet"].split()))
         if snippet:
             print(textwrap.fill(snippet, width=width, initial_indent="   ", subsequent_indent="   "))
-    for i, r in enumerate(results[:AUTO_TRIES], 1):
-        try:
-            page = fetch_page(r["url"], timeout=10)
-        except FetchError as e:
-            print(f"\n(skipped result {i}: {e})")
-            continue
-        print()
-        show_page(page, AUTO_CHARS, label=f"Result {i}: ")
-        return
-    print('\nCould not read any result. Read one yourself: yuy "fetch <url>"')
+    relevance.show_relevant(query, results, fetch_page, FetchError, term_width())
 
 
 def do_enginetest(s):
