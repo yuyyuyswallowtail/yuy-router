@@ -28,6 +28,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from html import unescape
 from html.parser import HTMLParser
 
 HOME = os.path.realpath(os.path.expanduser("~"))
@@ -580,8 +581,15 @@ def do_websearch(s):
         die(f"Bing returned HTTP {e.code}: {search_url}")
     except OSError as e:
         die(f"Could not reach Bing: {getattr(e, 'reason', e)}")
+    html = raw.decode(charset, "replace")
+    m = re.search(r"<title[^>]*>(.*?)</title>", html, re.S | re.I)
+    page_title = " ".join(unescape(m.group(1)).split()) if m else ""
+    words = [w for w in re.findall(r"\w+", query.lower()) if len(w) > 2]
+    if page_title and words and not any(w in page_title.lower() for w in words):
+        die(f'Bing answered a different search ("{page_title}") than "{query}", so nothing is shown.\n'
+            f'Try again in a moment, or open it yourself: yuy "open {search_url} in browser"')
     parser = BingParser()
-    parser.feed(raw.decode(charset, "replace"))
+    parser.feed(html)
     found = [x for x in parser.results
              if x["title"].strip() and real_url(x["url"]).startswith(("http://", "https://"))]
     print(f"== Web search (Bing): {query} ==")
