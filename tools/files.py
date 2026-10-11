@@ -8,7 +8,8 @@
   files.py delete  "delete ~/old.txt"        (moved to a trash folder, not removed)
   files.py fetch   "fetch https://example.com"
   files.py browser "open https://example.com in browser"
-  files.py websearch "search the web for laravel 14"   (Bing, HTML scraping, no API key)
+  files.py websearch "search the web for laravel 14"   (Bing, then Brave, Mojeek, Yahoo; no API key)
+  files.py enginetest "laravel 14"                     (which of those engines work from here)
 
 Safety: every path must resolve inside $HOME (symlinks resolved). ~/.ssh ~/.gnupg ~/.aws
 are never touched and .git is never written. create never overwrites. edit prints a diff and
@@ -28,6 +29,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from html import unescape
 from html.parser import HTMLParser
 
 HOME = os.path.realpath(os.path.expanduser("~"))
@@ -447,14 +449,14 @@ class FetchError(Exception):
     pass
 
 
-def fetch_page(url):
+def fetch_page(url, timeout=20):
     """-> (final url, status, content type, title, text, truncated). Raises FetchError."""
     req = urllib.request.Request(url, headers={
         "User-Agent": "Mozilla/5.0 (compatible; yuy-router)",
         "Accept": "text/html,text/plain,application/json;q=0.9,*/*;q=0.5",
     })
     try:
-        with urllib.request.urlopen(req, timeout=20) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             raw = r.read(MAX_DOWNLOAD + 1)
             ctype = r.headers.get_content_type()
             charset = r.headers.get_content_charset() or "utf-8"
@@ -560,45 +562,170 @@ def real_url(href):
     return href
 
 
+class SearchError(Exception):
+    pass
+
+
+LAST_HTML = ""  # raw page of the last http_get, saved by enginetest
+
+
+def http_get(url, timeout=12):
+    global LAST_HTML
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "en-US,en;q=0.9,id;q=0.8",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read(MAX_DOWNLOAD)
+            LAST_HTML = raw.decode(r.headers.get_content_charset() or "utf-8", "replace")
+            return LAST_HTML
+    except urllib.error.HTTPError as e:
+        raise SearchError(f"HTTP {e.code}")
+    except (OSError, LookupError) as e:
+        raise SearchError(str(getattr(e, "reason", e)))
+
+
+def bing_search(query):
+    url = "https://www.bing.com/search?" + urllib.parse.urlencode({"q": query, "setlang": "en-US"})
+    parser = BingParser()
+    parser.feed(http_get(url))
+    return [{"title": x["title"], "url": real_url(x["url"]), "snippet": x["snippet"]} for x in parser.results]
+
+
+# Engine-agnostic result finder: external links with a readable title, plus the text right after them.
+DOMAINLIKE = re.compile(r"^(?:https?://)?(?:www\.)?[\w-]+(?:\.[\w-]+)+(?:\s*[›»/].*)?$", re.I)
+
+
+def unwrap(href):
+    """Yahoo wraps links as r.search.yahoo.com/.../RU=<encoded real url>/RK=..."""
+    m = re.search(r"/RU=([^/]+)/R[KS]=", href)
+    return urllib.parse.unquote(m.group(1)) if m and "yahoo.com" in href else href
+
+
+class SerpParser(HTMLParser):
+    SKIP = {"script", "style", "noscript", "svg", "template", "nav", "footer", "form", "button", "select"}
+
+    def __init__(self, own):
+        super().__init__(convert_charrefs=True)
+        self.own, self.results = own, []
+        self.skip = 0
+        self.cur = None   # external link being read: {"url": ..., "parts": [text pieces]}
+        self.last = None  # last accepted result, collects the snippet text that follows it
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.SKIP:
+            self.skip += 1
+        elif tag == "a" and not self.skip:
+            self.last = None
+            url = unwrap(dict(attrs).get("href") or "")
+            host = urllib.parse.urlparse(url).netloc.lower()
+            if url.startswith(("http://", "https://")) and host and not host.endswith(self.own):
+                self.cur = {"url": url, "parts": []}
+
+    def handle_endtag(self, tag):
+        if tag in self.SKIP:
+            self.skip = max(self.skip - 1, 0)
+        elif tag == "a" and self.cur is not None:
+            kept = [p for p in self.cur["parts"] if "›" not in p and not DOMAINLIKE.match(p)]
+            if len(kept) > 1 and len(kept[1]) > len(kept[0]) and kept[1].lower().startswith(kept[0].lower()):
+                kept = kept[1:]  # a site name printed in front of the real title
+            title = " ".join(kept)
+            if len(title) >= 3:
+                known = next((r for r in self.results if r["url"] == self.cur["url"]), None)
+                if known:
+                    if len(title) > len(known["title"]):
+                        known["title"] = title
+                    self.last = known
+                else:
+                    self.last = {"title": title, "url": self.cur["url"], "snippet": ""}
+                    self.results.append(self.last)
+            self.cur = None
+
+    def handle_data(self, data):
+        text = " ".join(data.split())
+        if self.skip or not text:
+            return
+        if self.cur is not None:
+            self.cur["parts"].append(text)
+        elif self.last is not None and len(self.last["snippet"]) < 220:
+            self.last["snippet"] = (self.last["snippet"] + " " + text).strip()
+
+
+def serp_search(template, own):
+    def search(query):
+        parser = SerpParser(own)
+        parser.feed(http_get(template.format(q=urllib.parse.quote_plus(query))))
+        return parser.results
+    return search
+
+
+# name, search function, whether to keep only results that mention the query (generic parsing also
+# picks up stray links). DuckDuckGo is left out on purpose: it is blocked in Indonesia.
+ENGINES = (
+    ("Bing", bing_search, False),
+    ("Brave", serp_search("https://search.brave.com/search?q={q}&source=web", ("brave.com", "bravesoftware.com")), True),
+    ("Mojeek", serp_search("https://www.mojeek.com/search?q={q}", ("mojeek.com", "mojeek.net")), True),
+    ("Yahoo", serp_search("https://search.yahoo.com/search?p={q}", ("yahoo.com", "yimg.com", "aol.com")), True),
+)
+
+
+def mentions(r, words):
+    text = f'{r["title"]} {r["snippet"]} {r["url"]}'.lower()
+    return any(w in text for w in words)
+
+
+def usable(results, words, strict=False):
+    """Keep entries with a title and an http(s) link. Unrelated results (an engine serving noise) are dropped."""
+    good = [r for r in results if r["title"].strip() and r["url"].startswith(("http://", "https://"))]
+    if words:
+        if strict:
+            good = [r for r in good if mentions(r, words)]
+        elif not any(mentions(r, words) for r in good):
+            good = []
+    return good
+
+
+def query_words(query):
+    return [w for w in re.findall(r"\w+", query.lower()) if len(w) > 2]
+
+
 def do_websearch(s):
     quoted = [a or b or c for a, b, c in QUOTED.findall(s)]
     query = quoted[0] if quoted else " ".join(
         w for w in QUOTED.sub(" ", s).split() if w.lower().strip(",.") not in WEB_STOP)
     if not query:
         die('Nothing to search for. Example: websearch "laravel 14 release date"')
-    search_url = "https://www.bing.com/search?" + urllib.parse.urlencode({"q": query, "setlang": "en-US"})
-    req = urllib.request.Request(search_url, headers={
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
-        "Accept": "text/html,application/xhtml+xml",
-        "Accept-Language": "en-US,en;q=0.9,id;q=0.8",
-    })
-    try:
-        with urllib.request.urlopen(req, timeout=20) as r:
-            raw = r.read(MAX_DOWNLOAD)
-            charset = r.headers.get_content_charset() or "utf-8"
-    except urllib.error.HTTPError as e:
-        die(f"Bing returned HTTP {e.code}: {search_url}")
-    except OSError as e:
-        die(f"Could not reach Bing: {getattr(e, 'reason', e)}")
-    parser = BingParser()
-    parser.feed(raw.decode(charset, "replace"))
-    found = [x for x in parser.results
-             if x["title"].strip() and real_url(x["url"]).startswith(("http://", "https://"))]
-    print(f"== Web search (Bing): {query} ==")
-    if not found:
-        die("No results parsed (Bing may have shown a captcha or changed its HTML).\n"
-            f'Open it yourself: yuy "open {search_url} in browser"')
+    words = query_words(query)
+    results, engine, notes = [], "", []
+    for name, search, strict in ENGINES:
+        try:
+            results = usable(search(query), words, strict)
+        except SearchError as e:
+            notes.append(f"{name}: {e}")
+            continue
+        if results:
+            engine = name
+            break
+        notes.append(f"{name}: no results that match the query")
+    if not results:
+        bing = "https://www.bing.com/search?" + urllib.parse.urlencode({"q": query})
+        die("No usable web results.\n" + "\n".join(f"  {n}" for n in notes) +
+            f'\nOpen it yourself: yuy "open {bing} in browser"')
+    print(f"== Web search ({engine}): {query} ==")
+    if notes:
+        print("Note: " + "; ".join(notes))
     width = term_width()
-    for i, x in enumerate(found[:MAX_RESULTS], 1):
-        print(f"\n{i}. {' '.join(x['title'].split())}")
-        print(f"   {real_url(x['url'])}")
-        snippet = " ".join(x["snippet"].split())
+    for i, r in enumerate(results[:MAX_RESULTS], 1):
+        print(f"\n{i}. {' '.join(r['title'].split())}")
+        print(f"   {r['url']}")
+        snippet = re.sub(r"\s+([,.;:!?])", r"\1", " ".join(r["snippet"].split()))
         if snippet:
             print(textwrap.fill(snippet, width=width, initial_indent="   ", subsequent_indent="   "))
-    for i, x in enumerate(found[:AUTO_TRIES], 1):
-        url = real_url(x["url"])
+    for i, r in enumerate(results[:AUTO_TRIES], 1):
         try:
-            page = fetch_page(url)
+            page = fetch_page(r["url"], timeout=10)
         except FetchError as e:
             print(f"\n(skipped result {i}: {e})")
             continue
@@ -606,6 +733,28 @@ def do_websearch(s):
         show_page(page, AUTO_CHARS, label=f"Result {i}: ")
         return
     print('\nCould not read any result. Read one yourself: yuy "fetch <url>"')
+
+
+def do_enginetest(s):
+    """Try every search engine and say which ones work from this machine. Raw pages go to /tmp."""
+    query = " ".join(w for w in s.split() if w.lower() not in WEB_STOP) or "laravel"
+    words = query_words(query)
+    print(f"Query: {query}")
+    for name, search, strict in ENGINES:
+        started = time.time()
+        try:
+            results = usable(search(query), words, strict)
+            status = f"{len(results)} usable results"
+        except SearchError as e:
+            results, status = [], f"failed: {e}"
+        print(f"\n{name}: {status} ({time.time() - started:.1f}s)")
+        for r in results[:2]:
+            print(f"   {' '.join(r['title'].split())[:70]} -> {r['url']}")
+        if LAST_HTML:
+            path = f"/tmp/yuy-engine-{name.lower()}.html"
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(LAST_HTML)
+            print(f"   raw page: {path}")
 
 
 def do_browser(s):
@@ -620,7 +769,8 @@ def do_browser(s):
 
 ACTIONS = {"search": do_search, "read": do_read, "create": do_create, "edit": do_edit,
            "delete": do_delete, "fetch": do_fetch, "browser": do_browser,
-           "websearch": do_websearch}
+           "websearch": do_websearch,
+           "enginetest": do_enginetest}
 
 
 def main():
