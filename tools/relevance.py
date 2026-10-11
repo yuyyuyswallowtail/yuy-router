@@ -6,14 +6,15 @@ rank_results   sorts search results by how well they match the query. It uses Em
                word matching when that server cannot be reached.
 show_relevant  reads the most relevant pages in parallel and prints a direct answer built from
                complete, self-contained sentences picked with EmbeddingGemma (extractive, nothing is
-               generated). The answer has a Summary (one cohesive paragraph: a topic sentence, then
-               supporting facts in a logical order, joined with "It" and light transitions), Key facts
-               (facts that did not fit in the paragraph), Highlights (feature names with a one-line
-               explanation), and Sources numbered in order of appearance. Cut-off snippets, meta
-               sentences, taglines, dangling references, opinions, advice, near duplicates, and
-               forecasts whose date has already passed are left out or ranked lower. With -d/--debug
-               (or YUY_DEBUG=1) the candidate table and the matching paragraphs of every page are
-               printed as well, and sources keep their result-list rank.
+               generated). The answer has a Summary (one cohesive paragraph: a topic sentence that says
+               what the subject is, then supporting facts in a logical order, joined with "It" and light
+               transitions), Key facts (facts that did not fit in the paragraph), Highlights (feature
+               names with a one-line explanation), and Sources numbered in order of appearance. Cut-off
+               snippets, meta sentences, taglines, dangling references, opinions, advice, near
+               duplicates, and forecasts whose date has already passed are left out or ranked lower.
+               With -d/--debug (or YUY_DEBUG=1) the candidate table, how the headings of every page were
+               read, and the matching paragraphs of every page are printed as well, and sources keep
+               their result-list rank.
 
 Numbers in the query ("14" in "laravel 14") must appear in a result, paragraph, or sentence to count.
 """
@@ -43,6 +44,7 @@ PAGES = 3                  # pages shown at most in the debug view
 FETCH_TIMEOUT = 10         # seconds per page
 EXCERPTS = 3               # paragraphs shown per page in the debug view (at most one a heading)
 EXCERPT_CHARS = 500        # characters per paragraph in the debug view
+TRACE_LINES = 40           # heading decisions shown per page in the debug view
 
 ANSWER_SENTENCES = 4       # sentences in the answer at most
 ANSWER_WINDOW = 0.12       # only sentences within this score distance of the best one
@@ -61,6 +63,8 @@ SENT_PHRASE_BONUS = 0.05   # the sentence holds the query words next to each oth
 SUBJECT_BONUS = 0.04       # the sentence starts with the query phrase ("Laravel 13 requires ...")
 LEAD_BONUS = 0.04          # one of the first sentences of its page (usually the summary)
 LEAD_SENTENCES = 3
+TOPIC_LEAD_BONUS = 0.05    # topic sentence: a page's opening sentence says what the subject is
+TOPIC_SUBJECT_BONUS = 0.03 # topic sentence: starts with the subject
 FACT_BONUS = 0.04          # dates, versions, and other numbers (three count at most)
 RANK_BONUS = 0.04          # sentences from higher ranked pages score a little higher
 YOU_PENALTY = 0.05         # "you/your" voice (tutorials, marketing)
@@ -73,6 +77,7 @@ HIGHLIGHTS = 8             # key points listed at most
 HL_MIN_PAGES = 2           # a key point must be listed by this many pages (when that many pages have a list)
 HL_MATCH = 0.75            # share of content words two key point names must have in common to count as one
 HL_OVERVIEW = 3            # a sentence naming this many key points is an overview: the list says it better
+HL_RAW_CHARS = 3000        # text kept per feature section, to tell whether a short heading is part of it
 FEATURE_SLOTS = 2          # answer sentences that name a key point, when key points exist
 FEATURE_WINDOW = 0.30      # such a sentence may score this far below the best one
 TAGS_SHOWN = 2             # source tags shown per line; "(+N)" says how many more pages agree
@@ -160,6 +165,7 @@ CONTRAST = re.compile(r"\b(?:not|no|never|but|however|although|though|despite|un
                       r"yet|still|cannot)\b|n't\b", re.I)
 LOWER_FIRST = {"The", "A", "An", "It", "Its", "This", "These", "Those", "There"}
 TRANSITIONS = {2: "In addition,", 3: "Moreover,"}   # by position in the paragraph (0 = topic sentence)
+NOT_TOPIC = {"opinion", "advice", "vague", "you", "stale"}
 
 MONTHS = {m: i for i, m in enumerate("jan feb mar apr may jun jul aug sep oct nov dec".split(), 1)}
 DATE_Q = re.compile(r"\bQ([1-4])\s*(20\d\d)\b", re.I)
@@ -459,7 +465,8 @@ def stale_forecast(text, today=None):
 # ---------------------------------------------------------------- the answer
 
 def query_variants(query):
-    """Several ways to ask for the same thing, so facts beat sentences that merely repeat the keywords."""
+    """Several ways to ask for the same thing, so facts beat sentences that merely repeat the keywords.
+    Index 1 ("What is ...?") is also used to find the topic sentence."""
     return [query, f"What is {query}?", f"Key facts and details about {query}"]
 
 
@@ -585,9 +592,10 @@ def select(cands, points=()):
 
 
 def score_candidate(c, qvecs, nums, phrase, subject, today):
-    """Total score of one sentence. Also sets c["qcos"] and c["flags"] (shown in the debug table)."""
+    """Total score of one sentence. Also sets c["qcos"], c["qwhat"] (closeness to 'What is ...?') and c["flags"]."""
     text = c["text"]
     qcos = sum(dot(q, c["vec"]) for q in qvecs) / len(qvecs) if qvecs else c["lex"]
+    c["qwhat"] = dot(qvecs[1], c["vec"]) if qvecs else c["lex"]
     facts = [t for t in re.findall(r"\d+(?:\.\d+)*", text) if t not in nums]
     c["facts"] = set(facts)
     flags = []
@@ -661,66 +669,87 @@ def item_note(item):
 
 
 def part_of(name, raw):
-    """True when a short heading ('Models') is just one of the things the paragraph of the feature above it
-    lists ('... your models, jobs, and commands ...')."""
-    stem = name.lower().rstrip("s")
-    return bool(raw and stem) and bool(re.search(rf"\b{re.escape(stem)}s?\b", raw.lower()))
+    """True when a one-word heading ('Models') is just one of the things the section of the feature above it
+    lists ('... your models, jobs, and commands ...'). Only plain single words qualify: 'PHP Attributes' or
+    'Cache::touch()' are features of their own."""
+    if len(name.split()) != 1 or not name.isalpha() or not raw:
+        return False
+    return bool(re.search(rf"\b{re.escape(name.lower().rstrip('s'))}s?\b", raw.lower()))
 
 
-def page_features(text, nums=()):
+def page_features(text, nums=(), trace=None):
     """-> (features, strong). Features of a release page as {"name", "note", "raw", "parts"}: the headings one
-    level below a 'New features' / 'Release' heading (deeper headings, and short headings that the paragraph above
-    them lists, become the parts of that feature; its first paragraph gives the note), or else the short list items
-    below one. strong: that heading itself says 'new' or 'features'."""
+    level below a 'New features' / 'Release' heading (deeper headings, and one-word headings that the section
+    above them lists, become the parts of that feature; its first fitting paragraph gives the note), or else the
+    short list items below one. strong: that heading itself says 'new' or 'features'. trace collects what was
+    decided for every heading (shown with -d)."""
+    def log(msg):
+        if trace is not None:
+            trace.append(msg)
+
     heads, items, parent, child, strong, cur = [], [], 0, 0, False, None
     for b in blocks(text):
         if b.startswith("#"):
             level, title = len(b) - len(b.lstrip("#")), b.lstrip("#").strip()
+            tag = f"h{level} {textwrap.shorten(title, width=60, placeholder='...')!r}"
             other = VERSIONED.match(title)
             if other and nums and other.group(1) not in nums:  # a section about another version: stop collecting
                 parent = child = 0
                 cur = None
+                log(f"{tag}: section about another version, stop")
             elif parent and level > parent:
                 if not child:
                     child = level
                 name = highlight_name(title)
                 if level == child:
                     prev = heads[-1] if heads else None
-                    if name and prev is not None and len(name.split()) <= 2 and part_of(name, prev["raw"]):
+                    if name and prev is not None and part_of(name, prev["raw"]):
                         prev["parts"].append(name)
                         cur = prev
+                        log(f"{tag}: part of {prev['name']!r}")
                     elif name:
                         cur = {"name": name, "note": "", "raw": "", "parts": []}
                         heads.append(cur)
+                        log(f"{tag}: feature {name!r}")
                     else:
                         cur = None
+                        log(f"{tag}: not a feature name")
                 elif cur is not None and name:
                     cur["parts"].append(name)
+                    log(f"{tag}: sub-part of {cur['name']!r}")
+                else:
+                    log(f"{tag}: deeper heading, ignored")
             elif HL_HEAD.search(title):
                 parent, child, cur = level, 0, None
                 strong = strong or bool(HL_STRONG.search(title))
+                log(f"{tag}: collecting below this heading")
             else:
                 parent = child = 0
                 cur = None
+                log(f"{tag}: ends the section")
         elif parent and b.startswith("- "):
             name = highlight_name(b[2:])
             if name:
                 items.append({"name": name, "note": item_note(b[2:]), "raw": b, "parts": []})
+                log(f"item {name!r}")
         elif parent and cur is not None:
-            if not cur["raw"]:
-                cur["raw"] = b
+            if len(cur["raw"]) < HL_RAW_CHARS:
+                cur["raw"] = f"{cur['raw']} {b}".strip()
             if not cur["note"]:
                 cur["note"] = note_sentence(b)
     return (heads if len(heads) >= 3 else items), strong
 
 
-def collect_highlights(pairs, words=(), nums=()):
+def collect_highlights(pairs, words=(), nums=(), trace=None):
     """-> [{"name", "pages": [ranks], "note", "parts"}] for the key points several pages list, most agreed on
-    first. A single page is only trusted when its heading itself says 'new' or 'features'."""
+    first. A single page is only trusted when its heading itself says 'new' or 'features'. trace: {rank: lines}."""
     lists = []
     for r, (page, _err) in pairs:
         if page is not None:
-            feats, strong = page_features(page[4], nums)
+            lines = [] if trace is not None else None
+            feats, strong = page_features(page[4], nums, lines)
+            if trace is not None and lines:
+                trace[r["rank"]] = lines
             if feats:
                 lists.append((r["rank"], feats, strong))
     groups, qwords = [], set(words)
@@ -794,7 +823,20 @@ def src_ranks(c):
     return [c["src"]] + [s for s in c["support"] if s != c["src"]]
 
 
-def arrange(chosen, points):
+def pick_topic(cands, points):
+    """The sentence that says what the subject is: the plain sentence (no numbers, no dates, no opinion or advice,
+    not about one feature) closest to 'What is ...?' among ALL candidates, whether or not the selection kept it."""
+    top = max(c["score"] for c in cands)
+    pool = [c for c in cands
+            if not c["facts"] and not end_dates(c["text"]) and not NOT_TOPIC & set(c["flags"])
+            and c["score"] >= top - FEATURE_WINDOW and not mentions_point(c["text"], points)]
+    if not pool:
+        return None
+    return max(pool, key=lambda c: c["qwhat"] + (TOPIC_LEAD_BONUS if "lead" in c["flags"] else 0.0)
+               + (TOPIC_SUBJECT_BONUS if "subject" in c["flags"] else 0.0))
+
+
+def arrange(chosen, cands, points):
     """-> (topic sentence or None, supporting sentences in a logical order). A sentence about one or two key points
     becomes the explanation of that point when the page gave none; a sentence that lists three or more is an
     overview that the Highlights say better, so it is left out."""
@@ -811,11 +853,15 @@ def arrange(chosen, points):
             numeric.append(c)
         else:
             plain.append(c)
-    topic = max(plain, key=lambda c: ("lead" in c["flags"], c["score"])) if plain else None
+    topic = pick_topic(cands, points)
+    if topic is None and plain:
+        topic = max(plain, key=lambda c: ("lead" in c["flags"], c["score"]))
     rest = sorted(numeric, key=lambda c: (fact_rank(c["text"]), -c["score"]))
     rest += sorted((c for c in plain if c is not topic), key=lambda c: -c["score"])
     if topic is None and rest:
         topic, rest = rest[0], rest[1:]
+    if topic is not None:
+        rest = [c for c in rest if c is not topic and not duplicate(c, topic)]
     return topic, rest
 
 
@@ -894,18 +940,19 @@ def print_answer(query, pairs, words, nums, phrase, strict, width):
             c.pop("vec", None)
             c["support"] = []
 
+    debug = debug_on()
     today = datetime.date.today()
     subject = subject_re(words, phrase)
     for c in cands:
         score_candidate(c, qvecs, nums, phrase, subject, today)
 
-    points = collect_highlights(pairs, words, nums) if HL_QUERY.search(query) else []
+    trace = {} if debug else None
+    points = collect_highlights(pairs, words, nums, trace) if HL_QUERY.search(query) else []
     chosen = select(cands, points)
     if not chosen:
         return False
 
-    debug = debug_on()
-    topic, rest = arrange(chosen, points)
+    topic, rest = arrange(chosen, cands, points)
     paragraph, leftover = compose_paragraph(topic, rest, subject, nums)
     tags = Tags(keep_ranks=debug)
 
@@ -938,18 +985,27 @@ def print_answer(query, pairs, words, nums, phrase, strict, width):
 
     if debug:
         print("\n== Answer candidates (debug): score, query cosine, supporting pages, flags, page, sentence ==")
-        print("(page = rank in the result list)")
+        print("(page = rank in the result list; T = topic sentence of the Summary)")
         for c in sorted(cands, key=lambda c: -c["score"])[:10]:
-            mark = "*" if c in chosen else " "
+            mark = "T" if c is topic else ("*" if c in chosen else " ")
             others = [x for x in chosen if x is not c]
             near = max((similarity(c, x) for x in others), default=0.0)
             tag = c["flags"] + (["dup"] if c not in chosen and any(duplicate(c, x) for x in others) else [])
             tag += ["feature"] if points and mentions_point(c["text"], points) else []
             flags = f" {','.join(tag)}" if tag else ""
-            print(f"{mark} {c['score']:.3f} q={c['qcos']:.3f} sup={len(c['support'])} near={near:.2f}{flags} "
-                  f"[{c['src']}] {textwrap.shorten(c['text'], width=100, placeholder='...')}")
+            print(f"{mark} {c['score']:.3f} q={c['qcos']:.3f} what={c['qwhat']:.3f} sup={len(c['support'])} "
+                  f"near={near:.2f}{flags} [{c['src']}] {textwrap.shorten(c['text'], width=90, placeholder='...')}")
+        if topic is not None and all(topic is not c for c in sorted(cands, key=lambda c: -c["score"])[:10]):
+            print(f"T {topic['score']:.3f} q={topic['qcos']:.3f} what={topic['qwhat']:.3f} [{topic['src']}] "
+                  f"{textwrap.shorten(topic['text'], width=90, placeholder='...')}")
         if threshold is not None:
             print(f"(agreement threshold {threshold:.3f}, {len(cands)} candidate sentences)")
+        if trace:
+            print("\n== Highlights trace (debug): how the headings of every page were read ==")
+            for rank, lines in sorted(trace.items()):
+                print(f"[{rank}] {len(lines)} headings and items")
+                for line in lines[:TRACE_LINES]:
+                    print(f"    {line}")
     return True
 
 
