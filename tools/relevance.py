@@ -7,9 +7,10 @@ rank_results   sorts search results by how well they match the query. It uses Em
 show_relevant  reads the most relevant pages in parallel and prints a direct answer: complete,
                self-contained sentences that match the query best, picked with EmbeddingGemma
                (extractive, nothing is generated), each tagged with the pages that say the same.
-               Cut-off snippets, meta sentences, near duplicates, and forecasts whose date has
-               already passed are left out. With -d/--debug (or YUY_DEBUG=1) the candidate table
-               and the matching paragraphs of every page are printed as well.
+               Cut-off snippets, meta sentences, opinions, advice, near duplicates, and forecasts
+               whose date has already passed are left out or ranked lower. With -d/--debug (or
+               YUY_DEBUG=1) the candidate table and the matching paragraphs of every page are
+               printed as well.
 
 Numbers in the query ("14" in "laravel 14") must appear in a result, paragraph, or sentence to count.
 """
@@ -53,10 +54,15 @@ DUP = 0.88                 # cosine above which two sentences are near duplicate
 CONTAIN = 0.70             # share of the shorter sentence's content words found in a chosen one
 CONSENSUS_BONUS = 0.08     # score bonus when other pages agree (two pages count at most)
 SENT_PHRASE_BONUS = 0.05   # the sentence holds the query words next to each other
+SUBJECT_BONUS = 0.04       # the sentence starts with the query phrase ("Laravel 13 requires ...")
+LEAD_BONUS = 0.04          # one of the first sentences of its page (usually the summary)
+LEAD_SENTENCES = 3
 FACT_BONUS = 0.04          # dates, versions, and other numbers (three count at most)
 RANK_BONUS = 0.04          # sentences from higher ranked pages score a little higher
 YOU_PENALTY = 0.05         # "you/your" voice (tutorials, marketing)
 STALE_PENALTY = 0.15       # a forecast ("expected", "scheduled", ...) whose dates are all in the past
+OPINION_PENALTY = 0.08     # evaluative language instead of facts
+ADVICE_PENALTY = 0.08      # advice and instructions instead of facts
 
 STOP = set("""the a an of in on for to and or is are was were be what how why when where which who
 about with web search websearch lookup look up cari carikan tentang di internet online dan yang
@@ -67,6 +73,7 @@ CODE_CHARS = set("$;{}<>[]=\\|`")
 SENT_SPLIT = re.compile(r'(?<=[.!?])\s+(?=[A-Z0-9"“(\[])')
 SENT_END = re.compile(r"[.!?][\"”')\]]*$")
 CUT_END = re.compile(r"(?:\.{2,}|…)$")
+FLUFF_SPLIT = re.compile(r"\s[—–]\s")
 BOILER = re.compile(
     r"\b(cookies?|subscribe|newsletter|sign up|log in|privacy policy|terms of (?:use|service)|"
     r"all rights reserved|follow us|share this|read more|advertisement|click here|table of contents)\b",
@@ -80,6 +87,13 @@ META = re.compile(
     r"^(?:what (?:is|are|we|you)\b|here(?:'s| is| are)\b|in this (?:article|post|guide|video|tutorial)\b|"
     r"this (?:article|post|guide|video|tutorial)\b|everything you\b|learn\b|discover\b|find out\b|"
     r"read on\b|let's\b|let me\b|welcome\b|introduction\b)", re.I)
+OPINION = re.compile(
+    r"\b(?:might feel|feels? like|one of the (?:most|best)|the (?:biggest|best|worst)|exactly why|"
+    r"game[- ]?changer|amazing|awesome|incredible|honestly|most important|roundups?|listicles?|"
+    r"in my opinion|i think|i believe|personally)\b", re.I)
+ADVICE = re.compile(
+    r"^(?:waiting|upgrading|migrating|updating|if you|when you|make sure|don't|do not|avoid|consider|"
+    r"remember|keep|use|try|check)\b", re.I)
 YOU = re.compile(r"\b(?:you|your|yours|you'll|you've|you're|yourself)\b", re.I)
 
 MONTHS = {m: i for i, m in enumerate("jan feb mar apr may jun jul aug sep oct nov dec".split(), 1)}
@@ -132,6 +146,15 @@ def phrase_re(words):
         return None
     sep = r"[\W_]{1,3}(?:v(?=\d))?"
     return re.compile(r"(?<!\w)" + sep.join(re.escape(w) for w in words), re.I)
+
+
+def subject_re(words, phrase):
+    """A sentence that starts with the query phrase (optionally after 'The') talks about the subject itself."""
+    if phrase is not None:
+        return re.compile(r"^(?:the\s+)?" + phrase.pattern, re.I)
+    if words:
+        return re.compile(r"^(?:the\s+)?" + token_re(words[0]).pattern, re.I)
+    return None
 
 
 # ---------------------------------------------------------------- embeddings
@@ -291,6 +314,14 @@ def excerpts(text, words, nums, phrase, strict):
     return [window(b, focus, EXCERPT_CHARS) for _, b in sorted(picked)]
 
 
+def trim_fluff(s):
+    """Cut an opinion tail after a dash: 'Released on March 17 — and it is the best yet.' -> 'Released on March 17.'"""
+    parts = FLUFF_SPLIT.split(s, maxsplit=1)
+    if len(parts) == 2 and OPINION.search(parts[1]) and len(parts[0]) >= MIN_SENT_CHARS:
+        return parts[0].rstrip(" ,;:") + "."
+    return s
+
+
 def good_sentence(s):
     """A complete sentence that still makes sense on its own (no titles, breadcrumbs, 'This is ...', cut-offs)."""
     return (MIN_SENT_CHARS <= len(s) <= 420 and len(s.split()) >= MIN_SENT_WORDS
@@ -310,7 +341,7 @@ def page_sentences(text):
         if b.startswith("- "):
             b = b[2:]
         for s in SENT_SPLIT.split(b):
-            s = s.strip()
+            s = trim_fluff(s.strip())
             if good_sentence(s):
                 out.append(s)
     return out
@@ -333,7 +364,7 @@ def snippet_sentences(snippet):
         at = max(last.rfind(", "), last.rfind(" — "), last.rfind("; "))
         if at >= MIN_SENT_CHARS:
             parts.append(last[:at] + ".")
-    return [p for p in parts if good_sentence(p)]
+    return [p for p in (trim_fluff(p) for p in parts) if good_sentence(p)]
 
 
 # ---------------------------------------------------------------- dates
@@ -374,21 +405,23 @@ def build_candidates(pairs, words, nums, phrase, strict):
     plain = [w for w in words if w not in nums]
     cands, seen = [], set()
     for r, (page, _err) in pairs:
-        pool = page_sentences(page[4]) if page is not None else snippet_sentences(r["snippet"])
+        readable = page is not None
+        pool = page_sentences(page[4]) if readable else snippet_sentences(r["snippet"])
         scored = []
-        for s in pool:
+        for pos, s in enumerate(pool):
             score, hits = lexical(s, words, phrase)
             if hits < need_hits or (plain and not any(has(s, w) for w in plain)):
                 continue
             if strict and not all(has(s, n) for n in nums):
                 continue
-            scored.append((score, s))
+            scored.append((score, pos, s))
         scored.sort(key=lambda x: -x[0])
-        for score, s in scored[:SENTENCES_PER_PAGE]:
+        for score, pos, s in scored[:SENTENCES_PER_PAGE]:
             if s.lower() in seen:
                 continue
             seen.add(s.lower())
-            cands.append({"text": s, "src": r["rank"], "lex": score, "support": []})
+            cands.append({"text": s, "src": r["rank"], "lex": score, "support": [],
+                          "pos": pos if readable else None})
     return cands
 
 
@@ -442,6 +475,39 @@ def select(cands):
     return chosen
 
 
+def score_candidate(c, qvecs, nums, phrase, subject, today):
+    """Total score of one sentence. Also sets c["qcos"] and c["flags"] (shown in the debug table)."""
+    text = c["text"]
+    qcos = sum(dot(q, c["vec"]) for q in qvecs) / len(qvecs) if qvecs else c["lex"]
+    facts = [t for t in re.findall(r"\d+(?:\.\d+)*", text) if t not in nums]
+    flags = []
+    score = qcos
+    if phrase and phrase.search(text):
+        score += SENT_PHRASE_BONUS
+    score += CONSENSUS_BONUS * min(len(c["support"]), 2) / 2
+    score += FACT_BONUS * min(len(facts), 3) / 3
+    score += RANK_BONUS * (TRIES - min(c["src"], TRIES)) / TRIES
+    if YOU.search(text):
+        score -= YOU_PENALTY
+        flags.append("you")
+    if stale_forecast(text, today):
+        score -= STALE_PENALTY
+        flags.append("stale")
+    if OPINION.search(text):
+        score -= OPINION_PENALTY
+        flags.append("opinion")
+    if ADVICE.match(text):
+        score -= ADVICE_PENALTY
+        flags.append("advice")
+    if subject and subject.match(text):
+        score += SUBJECT_BONUS
+        flags.append("subject")
+    if c.get("pos") is not None and c["pos"] < LEAD_SENTENCES:
+        score += LEAD_BONUS
+        flags.append("lead")
+    c["qcos"], c["flags"], c["score"] = qcos, flags, score
+
+
 def print_answer(query, pairs, words, nums, phrase, strict, width):
     """Print the direct answer. -> False when no sentence qualified."""
     cands = build_candidates(pairs, words, nums, phrase, strict)
@@ -464,18 +530,9 @@ def print_answer(query, pairs, words, nums, phrase, strict, width):
             c["support"] = []
 
     today = datetime.date.today()
+    subject = subject_re(words, phrase)
     for c in cands:
-        qcos = sum(dot(q, c["vec"]) for q in qvecs) / len(qvecs) if qvecs else c["lex"]
-        facts = [t for t in re.findall(r"\d+(?:\.\d+)*", c["text"]) if t not in nums]
-        c["qcos"] = qcos
-        c["stale"] = stale_forecast(c["text"], today)
-        c["score"] = (qcos
-                      + (SENT_PHRASE_BONUS if phrase and phrase.search(c["text"]) else 0.0)
-                      + CONSENSUS_BONUS * min(len(c["support"]), 2) / 2
-                      + FACT_BONUS * min(len(facts), 3) / 3
-                      + RANK_BONUS * (TRIES - min(c["src"], TRIES)) / TRIES
-                      - (YOU_PENALTY if YOU.search(c["text"]) else 0.0)
-                      - (STALE_PENALTY if c["stale"] else 0.0))
+        score_candidate(c, qvecs, nums, phrase, subject, today)
 
     chosen = select(cands)
     if not chosen:
@@ -501,11 +558,11 @@ def print_answer(query, pairs, words, nums, phrase, strict, width):
             print(f"[{t}] {title} ({host_of(r['url'])})\n    {r['url']}")
 
     if debug_on():
-        print("\n== Answer candidates (debug): score, query cosine, supporting pages, page, sentence ==")
+        print("\n== Answer candidates (debug): score, query cosine, supporting pages, flags, page, sentence ==")
         for c in sorted(cands, key=lambda c: -c["score"])[:10]:
             mark = "*" if c in chosen else " "
-            stale = " stale" if c["stale"] else ""
-            print(f"{mark} {c['score']:.3f} q={c['qcos']:.3f} sup={len(c['support'])}{stale} "
+            flags = f" {','.join(c['flags'])}" if c["flags"] else ""
+            print(f"{mark} {c['score']:.3f} q={c['qcos']:.3f} sup={len(c['support'])}{flags} "
                   f"[{c['src']}] {textwrap.shorten(c['text'], width=100, placeholder='...')}")
         if threshold is not None:
             print(f"(agreement threshold {threshold:.3f}, {len(cands)} candidate sentences)")
