@@ -143,7 +143,7 @@
     "cmd": ["python3", "{ROOT}/tools/files.py", "fetch"],
     "cwd": "~",
     "args": "query",
-    "timeout": 45,
+    "timeout": 90,
     "keywords": ["fetch", "scrape", "download page", "get page", "ambil halaman", "unduh halaman", "isi halaman"]
   },
   {
@@ -154,11 +154,11 @@
     "keywords": ["open in browser", "open in the browser", "buka di browser", "buka browser", "open website", "buka website", "buka situs", "open url", "browse"]
   },
   {
-    "desc": "search the web with Bing and list the top results with title, link and snippet",
+    "desc": "search the web with Bing for information about a topic, list the top results and show the content of the best one",
     "cmd": ["python3", "{ROOT}/tools/files.py", "websearch"],
     "cwd": "~",
     "args": "query",
-    "timeout": 45,
-    "keywords": ["websearch", "web search", "search the web", "search online", "search internet", "cari di web", "cari di internet", "bing"]
+    "timeout": 90,
+    "keywords": ["websearch", "web search", "search the web", "search online", "search internet", "search about", "search for", "look up", "lookup", "cari di web", "cari di internet", "cari tentang", "cari info", "cari informasi", "bing"]
   }
 ]

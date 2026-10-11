@@ -347,10 +347,12 @@ def get_url(s):
     return url
 
 
-def do_fetch(s):
-    if not URL.search(s):  # no URL in the sentence: treat it as a web search
-        return do_websearch(s)
-    url = get_url(s)
+class FetchError(Exception):
+    pass
+
+
+def fetch_page(url):
+    """-> (final url, status, content type, title, text, truncated). Raises FetchError."""
     req = urllib.request.Request(url, headers={
         "User-Agent": "Mozilla/5.0 (compatible; yuy-router)",
         "Accept": "text/html,text/plain,application/json;q=0.9,*/*;q=0.5",
@@ -362,11 +364,14 @@ def do_fetch(s):
             charset = r.headers.get_content_charset() or "utf-8"
             status, final = r.status, r.geturl()
     except urllib.error.HTTPError as e:
-        die(f"HTTP {e.code} {e.reason}: {url}")
+        raise FetchError(f"HTTP {e.code} {e.reason}")
     except OSError as e:
-        die(f"Could not fetch {url}: {getattr(e, 'reason', e)}")
+        raise FetchError(str(getattr(e, "reason", e)))
     cut = len(raw) > MAX_DOWNLOAD
-    text = raw[:MAX_DOWNLOAD].decode(charset, "replace")
+    try:
+        text = raw[:MAX_DOWNLOAD].decode(charset, "replace")
+    except LookupError:
+        text = raw[:MAX_DOWNLOAD].decode("utf-8", "replace")
     title = ""
     if ctype in ("text/html", "application/xhtml+xml"):
         p = TextExtractor()
@@ -375,14 +380,29 @@ def do_fetch(s):
         lines = [re.sub(r"[ \t]+", " ", ln).strip() for ln in "".join(p.out).splitlines()]
         text = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
     elif not (ctype.startswith("text/") or ctype.endswith(("json", "xml"))):
-        die(f"Not a text page ({ctype}), not shown: {url}")
+        raise FetchError(f"not a text page ({ctype})")
+    return final, status, ctype, title, text, cut
+
+
+def show_page(page, limit):
+    final, status, ctype, title, text, cut = page
     print(f"== {final} (HTTP {status}, {ctype}) ==")
     if title:
         print(f"Title: {title}")
     print()
-    print(text[:MAX_WEB])
-    if len(text) > MAX_WEB or cut:
-        print(f"\n... truncated at {MAX_WEB} characters ({len(text)} total).")
+    print(text[:limit])
+    if len(text) > limit or cut:
+        print(f"\n... truncated at {limit} characters ({len(text)} total).")
+
+
+def do_fetch(s):
+    if not URL.search(s):  # no URL in the sentence: treat it as a web search
+        return do_websearch(s)
+    url = get_url(s)
+    try:
+        show_page(fetch_page(url), MAX_WEB)
+    except FetchError as e:
+        die(f"Could not fetch {url}: {e}")
 
 
 # ---------------------------------------------------------------- web search (Bing)
@@ -390,6 +410,8 @@ def do_fetch(s):
 WEB_STOP = set("""websearch web search the on for cari carikan di internet online bing fetch from
 browser tentang about lookup look up google""".split())
 MAX_RESULTS = 8
+AUTO_TRIES = 3     # websearch shows the first result that can be read, trying this many
+AUTO_CHARS = 4000  # characters of that page to show
 
 
 class BingParser(HTMLParser):
@@ -478,7 +500,17 @@ def do_websearch(s):
         print(f"   {real_url(x['url'])}")
         if x["snippet"].strip():
             print(f"   {' '.join(x['snippet'].split())[:200]}")
-    print('\nTo read a result: yuy "fetch <url>"')
+    for x in found[:AUTO_TRIES]:
+        url = real_url(x["url"])
+        try:
+            page = fetch_page(url)
+        except FetchError as e:
+            print(f"\n(skipped {url}: {e})")
+            continue
+        print()
+        show_page(page, AUTO_CHARS)
+        return
+    print('\nCould not read any result. Read one yourself: yuy "fetch <url>"')
 
 
 def do_browser(s):
