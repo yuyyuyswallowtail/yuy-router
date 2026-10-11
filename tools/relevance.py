@@ -139,7 +139,8 @@ HL_HEAD = re.compile(r"\b(?:new|features?|highlights?|improvements?|changes?|add
 HL_JUNK = re.compile(r"^(?:download|install\w*|contribut\w*|related|summary|conclusion|introduction|overview|faq|"
                      r"comments?|share|references?|see also|resources?|about|changelog|credits|sponsors?|"
                      r"final thoughts|upgrad\w+|migration|wrapping up|key takeaways|table of contents|what'?s next|"
-                     r"getting started|support|requirements?|more)\b", re.I)
+                     r"getting started|support|requirements?|more|other|misc\w*|minor|bonus|extras?|how to|frequently asked|"
+                     r"keep reading|need help|want to|further reading|read more)\b", re.I)
 HL_REQ = re.compile(r"\b(?:minimum|requirements?|requires?)\b", re.I)  # a requirement is a fact, not a feature
 NAME_BAD = re.compile(
     r"^(?:find|see|turn|get|test|run|make|read|start|stop|set|add|enable|disable|install|update|upgrade|migrate|"
@@ -166,6 +167,14 @@ CONTRAST = re.compile(r"\b(?:not|no|never|but|however|although|though|despite|un
 LOWER_FIRST = {"The", "A", "An", "It", "Its", "This", "These", "Those", "There"}
 TRANSITIONS = {2: "In addition,", 3: "Moreover,"}   # by position in the paragraph (0 = topic sentence)
 NOT_TOPIC = {"opinion", "advice", "vague", "you", "stale"}
+# rhetoric instead of a definition: "isn't just about the present—it's laying groundwork for ..."
+RHETORIC = re.compile(r"\b(?:isn[’']t just|not just|more than just|laying (?:the )?groundwork|groundwork for|"
+                      r"what[’']s (?:coming|next|ahead))\b|\w—\w", re.I)
+CODE_TOKEN = re.compile(r"\w\(\)|::|->|\$\w|#\[")   # an API name: too specific to say what the subject is
+# headings where the list of features is over: how to upgrade, FAQ, other posts
+END_HEAD = re.compile(r"^(?:how to\b|frequently asked|keep reading|need help|want to\b|further reading|read more|"
+                      r"what[’']?s next|more from)", re.I)
+TOPIC_DEFINE_BONUS = 0.04  # topic sentence: the subject followed by a verb ("Laravel 13 continues ...")
 
 MONTHS = {m: i for i, m in enumerate("jan feb mar apr may jun jul aug sep oct nov dec".split(), 1)}
 DATE_Q = re.compile(r"\bQ([1-4])\s*(20\d\d)\b", re.I)
@@ -611,7 +620,7 @@ def score_candidate(c, qvecs, nums, phrase, subject, today):
     if stale_forecast(text, today):
         score -= STALE_PENALTY
         flags.append("stale")
-    if OPINION.search(text):
+    if OPINION.search(text) or RHETORIC.search(text):
         score -= OPINION_PENALTY
         flags.append("opinion")
     if ADVICE.match(text):
@@ -620,9 +629,12 @@ def score_candidate(c, qvecs, nums, phrase, subject, today):
     if VAGUE.search(text) and text.count(",") < 2:  # a list of named things is specific enough
         score -= VAGUE_PENALTY
         flags.append("vague")
-    if subject and subject.match(text):
+    m = subject.match(text) if subject else None
+    if m:
         score += SUBJECT_BONUS
         flags.append("subject")
+        if SUBJECT_VERB.match(text[m.end():].lstrip()):
+            flags.append("defines")
     if c.get("pos") is not None and c["pos"] < LEAD_SENTENCES:
         score += LEAD_BONUS
         flags.append("lead")
@@ -697,6 +709,10 @@ def page_features(text, nums=(), trace=None):
                 parent = child = 0
                 cur = None
                 log(f"{tag}: section about another version, stop")
+            elif parent and (CLOSING.match(title) or END_HEAD.match(title)):
+                parent = child = 0
+                cur = None
+                log(f"{tag}: closing section, stop")
             elif parent and level > parent:
                 if not child:
                     child = level
@@ -829,11 +845,13 @@ def pick_topic(cands, points):
     top = max(c["score"] for c in cands)
     pool = [c for c in cands
             if not c["facts"] and not end_dates(c["text"]) and not NOT_TOPIC & set(c["flags"])
+            and not CODE_TOKEN.search(c["text"])
             and c["score"] >= top - FEATURE_WINDOW and not mentions_point(c["text"], points)]
     if not pool:
         return None
     return max(pool, key=lambda c: c["qwhat"] + (TOPIC_LEAD_BONUS if "lead" in c["flags"] else 0.0)
-               + (TOPIC_SUBJECT_BONUS if "subject" in c["flags"] else 0.0))
+               + (TOPIC_SUBJECT_BONUS if "subject" in c["flags"] else 0.0)
+               + (TOPIC_DEFINE_BONUS if "defines" in c["flags"] else 0.0))
 
 
 def arrange(chosen, cands, points):
@@ -854,8 +872,9 @@ def arrange(chosen, cands, points):
         else:
             plain.append(c)
     topic = pick_topic(cands, points)
-    if topic is None and plain:
-        topic = max(plain, key=lambda c: ("lead" in c["flags"], c["score"]))
+    general = [c for c in plain if not CODE_TOKEN.search(c["text"])]
+    if topic is None and general:
+        topic = max(general, key=lambda c: ("lead" in c["flags"], c["score"]))
     rest = sorted(numeric, key=lambda c: (fact_rank(c["text"]), -c["score"]))
     rest += sorted((c for c in plain if c is not topic), key=lambda c: -c["score"])
     if topic is None and rest:
@@ -877,7 +896,8 @@ def compose_paragraph(topic, supports, subject, nums):
     refers = bool(subject and nums and subject.match(topic["text"]))  # "It" needs a clear subject to point at
     words_used, leftover, run = len(topic["text"].split()), [], 0
     for c in supports:
-        if len(items) >= PARA_SENTENCES or words_used >= PARA_WORDS or YOU.search(c["text"]):
+        if (len(items) >= PARA_SENTENCES or words_used >= PARA_WORDS or YOU.search(c["text"])
+                or CODE_TOKEN.search(c["text"])):
             leftover.append(c)
             continue
         text, pronoun = c["text"], False
@@ -914,7 +934,8 @@ def highlight_line(g, label):
     parts = [p for p in dict.fromkeys(g.get("parts", [])) if p.lower() != name.lower()][:4]
     extra = f" ({', '.join(parts)})" if parts else ""
     note = short_note(g["note"]) if g.get("note") else ""
-    if note and note.lower().startswith(name.lower()):  # the sentence already starts with the name
+    bare = re.sub(r"^(?:the|a|an)\s+", "", note, flags=re.I)
+    if note and bare.lower().startswith(name.lower()):  # the sentence already starts with the name
         return f"{note}{extra} {label}"
     return f"{name}{extra}: {note} {label}" if note else f"{name}{extra} {label}"
 
