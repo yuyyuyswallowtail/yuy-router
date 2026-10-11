@@ -112,3 +112,7 @@ yuy “fetch https://example.com” # page text in the terminal
 yuy “open https://example.com in browser” # xdg-open
 
 Quote the text you want to write or replace. Edits keep a backup in the trash folder.
+
+Web search uses Bing (HTML scraping, no API key, it can break if Bing changes its page):
+yuy “search the web for laravel 14 release date”
+yuy “fetch laravel 14” # no URL in the sentence: runs the same web search

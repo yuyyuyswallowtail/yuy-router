@@ -152,5 +152,13 @@
     "cwd": "~",
     "args": "query",
     "keywords": ["open in browser", "open in the browser", "buka di browser", "buka browser", "open website", "buka website", "buka situs", "open url", "browse"]
+  },
+  {
+    "desc": "search the web with Bing and list the top results with title, link and snippet",
+    "cmd": ["python3", "{ROOT}/tools/files.py", "websearch"],
+    "cwd": "~",
+    "args": "query",
+    "timeout": 45,
+    "keywords": ["websearch", "web search", "search the web", "search online", "search internet", "cari di web", "cari di internet", "bing"]
   }
 ]

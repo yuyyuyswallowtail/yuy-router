@@ -8,11 +8,13 @@
   files.py delete  "delete ~/old.txt"        (moved to a trash folder, not removed)
   files.py fetch   "fetch https://example.com"
   files.py browser "open https://example.com in browser"
+  files.py websearch "search the web for laravel 14"   (Bing, HTML scraping, no API key)
 
 Safety: every path must resolve inside $HOME (symlinks resolved). ~/.ssh ~/.gnupg ~/.aws
 are never touched and .git is never written. create never overwrites. edit prints a diff and
 keeps a backup. delete moves to ~/.local/share/yuy-trash. Standard library only.
 """
+import base64
 import difflib
 import fnmatch
 import os
@@ -346,6 +348,8 @@ def get_url(s):
 
 
 def do_fetch(s):
+    if not URL.search(s):  # no URL in the sentence: treat it as a web search
+        return do_websearch(s)
     url = get_url(s)
     req = urllib.request.Request(url, headers={
         "User-Agent": "Mozilla/5.0 (compatible; yuy-router)",
@@ -381,6 +385,102 @@ def do_fetch(s):
         print(f"\n... truncated at {MAX_WEB} characters ({len(text)} total).")
 
 
+# ---------------------------------------------------------------- web search (Bing)
+
+WEB_STOP = set("""websearch web search the on for cari carikan di internet online bing fetch from
+browser tentang about lookup look up google""".split())
+MAX_RESULTS = 8
+
+
+class BingParser(HTMLParser):
+    """Collects title, url and snippet from <li class="b_algo"> result blocks."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.results, self.cur = [], None
+        self.in_h2 = self.in_a = self.in_p = False
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "li" and "b_algo" in (a.get("class") or "").split():
+            self.cur = {"title": "", "url": "", "snippet": ""}
+            self.results.append(self.cur)
+        elif self.cur is None:
+            return
+        elif tag == "h2":
+            self.in_h2 = True
+        elif tag == "a" and self.in_h2 and not self.cur["url"]:
+            self.cur["url"] = a.get("href") or ""
+            self.in_a = True
+        elif tag == "p" and not self.in_h2 and not self.cur["snippet"].strip():
+            self.in_p = True
+
+    def handle_endtag(self, tag):
+        if tag == "h2":
+            self.in_h2 = self.in_a = False
+        elif tag == "a":
+            self.in_a = False
+        elif tag == "p":
+            self.in_p = False
+
+    def handle_data(self, data):
+        if self.cur is None:
+            return
+        if self.in_a:
+            self.cur["title"] += data
+        elif self.in_p:
+            self.cur["snippet"] += data
+
+
+def real_url(href):
+    """Bing often wraps links as bing.com/ck/a?...&u=a1<base64 of the real url>."""
+    q = urllib.parse.urlparse(href)
+    if q.netloc.endswith("bing.com") and q.path.startswith("/ck/a"):
+        u = urllib.parse.parse_qs(q.query).get("u", [""])[0]
+        if u.startswith("a1"):
+            try:
+                return base64.urlsafe_b64decode(u[2:] + "=" * (-len(u[2:]) % 4)).decode("utf-8")
+            except ValueError:
+                pass
+    return href
+
+
+def do_websearch(s):
+    quoted = [a or b or c for a, b, c in QUOTED.findall(s)]
+    query = quoted[0] if quoted else " ".join(
+        w for w in QUOTED.sub(" ", s).split() if w.lower().strip(",.") not in WEB_STOP)
+    if not query:
+        die('Nothing to search for. Example: websearch "laravel 14 release date"')
+    search_url = "https://www.bing.com/search?" + urllib.parse.urlencode({"q": query, "setlang": "en-US"})
+    req = urllib.request.Request(search_url, headers={
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "en-US,en;q=0.9,id;q=0.8",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            raw = r.read(MAX_DOWNLOAD)
+            charset = r.headers.get_content_charset() or "utf-8"
+    except urllib.error.HTTPError as e:
+        die(f"Bing returned HTTP {e.code}: {search_url}")
+    except OSError as e:
+        die(f"Could not reach Bing: {getattr(e, 'reason', e)}")
+    parser = BingParser()
+    parser.feed(raw.decode(charset, "replace"))
+    found = [x for x in parser.results
+             if x["title"].strip() and real_url(x["url"]).startswith(("http://", "https://"))]
+    print(f"== Web search (Bing): {query} ==")
+    if not found:
+        die("No results parsed (Bing may have shown a captcha or changed its HTML).\n"
+            f'Open it yourself: yuy "open {search_url} in browser"')
+    for i, x in enumerate(found[:MAX_RESULTS], 1):
+        print(f"\n{i}. {' '.join(x['title'].split())}")
+        print(f"   {real_url(x['url'])}")
+        if x["snippet"].strip():
+            print(f"   {' '.join(x['snippet'].split())[:200]}")
+    print('\nTo read a result: yuy "fetch <url>"')
+
+
 def do_browser(s):
     url = get_url(s)
     opener = shutil.which("xdg-open")
@@ -392,7 +492,8 @@ def do_browser(s):
 
 
 ACTIONS = {"search": do_search, "read": do_read, "create": do_create, "edit": do_edit,
-           "delete": do_delete, "fetch": do_fetch, "browser": do_browser}
+           "delete": do_delete, "fetch": do_fetch, "browser": do_browser,
+           "websearch": do_websearch}
 
 
 def main():
