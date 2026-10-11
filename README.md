@@ -116,3 +116,5 @@ Quote the text you want to write or replace. Edits keep a backup in the trash fo
 Web search uses Bing (HTML scraping, no API key, it can break if Bing changes its page):
 yuy “search the web for laravel 14 release date”
 yuy “fetch laravel 14” # no URL in the sentence: runs the same web search
+
+`search` decides by the sentence: with a folder path (`search about main.go on ~/Projects`) or a start like `search file ...` it searches files, otherwise it searches the web (`search about laravel 14`). Say `search the web ...` to force the web.

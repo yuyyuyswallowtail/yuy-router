@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """yuy file and web tools, called by router.py with the whole sentence as one argument.
 
-  files.py search  "search TODO in ~/Projects"
+  files.py search  "search TODO in ~/Projects"   (a folder path or "search file ..." = files, otherwise web)
   files.py read    "read ~/notes.txt lines 10-40"
   files.py create  'create ~/notes.txt with "hello"'   |   "create folder ~/x/y"
   files.py edit    'edit ~/notes.txt replace "old" with "new" [all]'   |   'edit FILE append "text"'
@@ -43,7 +43,7 @@ MAX_DOWNLOAD = 2_000_000  # fetch: bytes downloaded
 QUOTED = re.compile(r'"([^"]*)"|\'([^\']*)\'|“([^”]*)”')
 STOP = set("""search find cari carikan temukan for file files named called in di dalam inside
 containing contain contains content contents with text teks berisi isi yang mengandung
-folder directory direktori the a an all semua grep""".split())
+folder directory direktori the a an all semua grep on at under about tentang pada from within""".split())
 NOT_PATH = STOP | set("""read delete remove edit replace append create hapus baca buang ubah ganti
 tambahkan buat buatkan bikin dengan lines line baris browser fetch open new""".split())
 CONTENT = re.compile(r"\b(contain\w*|content\w*|inside|isi|berisi|mengandung|grep|text|teks)\b", re.I)
@@ -51,6 +51,11 @@ RANGE = re.compile(r"\b(?:lines?|baris)\s*(\d+)(?:\s*(?:-|to|sampai|hingga|until
 APPEND = re.compile(r"\b(append|tambahkan|tambah|add)\b", re.I)
 ALL = re.compile(r"\b(all|semua|every|seluruh)\b", re.I)
 DIRWORD = re.compile(r"\b(folder|dir|directory|direktori)\b", re.I)
+# "search ..." means files when the sentence has a folder path or starts like "search file ...",
+# and means the web otherwise
+WEB_WORD = re.compile(r"(?<![\w./\-])(web|internet|online|bing|google)(?![\w./\-])", re.I)
+FILE_HINT = re.compile(r"^\s*(?:search|find|cari|carikan|temukan)(?:\s+(?:for|the))?\s+"
+                       r"(?:files?|folders?|directory|content|contents|isi|berisi)\b", re.I)
 URL = re.compile(r"https?://[^\s\"'<>]+|(?<![\w@/.])(?:[\w\-]+\.)+[a-z]{2,}(?:/[^\s\"'<>]*)?", re.I)
 
 
@@ -151,6 +156,10 @@ def do_search(s):
             root_path = c
             del words[i]
             break
+    explicit_path = any(clean(w).startswith(("~", "/", "./", "../")) for w in words)
+    has_path = root_path is not None or explicit_path
+    if (WEB_WORD.search(s) and not has_path) or not (has_path or FILE_HINT.search(s) or "*" in s):
+        return do_websearch(s)
     if root_path is None:
         for w in words:
             c = clean(w)

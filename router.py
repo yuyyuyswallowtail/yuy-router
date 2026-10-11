@@ -21,6 +21,7 @@ Per-command options in commands.json:
   "keywords": [...]     -> words/phrases that add a score bonus when found in the sentence
   "sudo": true          -> run with sudo, always asks for confirmation
   "confirm": true       -> always ask for confirmation, even inside home
+  "boost": 0.25         -> score bonus for this command instead of BOOST (default 0.10)
   "timeout": seconds    -> time limit (default 30, or 3600 for sudo)
 "cwd": "." means the folder where yuy was started.
 Placeholders in cmd and cwd: {ROOT} (project folder), {LLAMA_SERVER}.
@@ -273,7 +274,15 @@ def keyword_hit(query, keywords):
 
 def split_tasks(query):
     """Split a sentence into task parts at the joining words. One part means a single task."""
-    return [p.strip() for p in SPLIT_RE.split(query) if p and p.strip()]
+    quotes = []  # text inside quotes is data (file content, search terms), never a task separator
+
+    def hide(m):
+        quotes.append(m.group(0))
+        return f"\0{len(quotes) - 1}\0"
+
+    masked = re.sub(r'"[^"]*"|(?<!\w)\'[^\']*\'(?!\w)', hide, query)
+    parts = [p.strip() for p in SPLIT_RE.split(masked) if p and p.strip()]
+    return [re.sub(r"\0(\d+)\0", lambda m: quotes[int(m.group(1))], p) for p in parts]
 
 
 def in_home(path):
@@ -325,7 +334,7 @@ def rank(text, qv, commands, dvs):
     for dv, c in zip(dvs, commands):
         s = sum(a * b for a, b in zip(qv, dv))
         boosted = (has_expr and c.get("args") == "expression") or keyword_hit(text, c.get("keywords", []))
-        scored.append((s + (BOOST if boosted else 0.0), boosted, c))
+        scored.append((s + (c.get("boost", BOOST) if boosted else 0.0), boosted, c))
     scored.sort(key=lambda x: x[0], reverse=True)
     return scored
 
