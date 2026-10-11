@@ -7,11 +7,13 @@ rank_results   sorts search results by how well they match the query. It uses Em
 show_relevant  reads the most relevant pages in parallel and prints a direct answer: complete,
                self-contained sentences that match the query best, picked with EmbeddingGemma
                (extractive, nothing is generated), each tagged with the pages that say the same.
-               With -d/--debug (or YUY_DEBUG=1) the candidate table and the matching paragraphs
-               of every page are printed as well.
+               Cut-off snippets, meta sentences, near duplicates, and forecasts whose date has
+               already passed are left out. With -d/--debug (or YUY_DEBUG=1) the candidate table
+               and the matching paragraphs of every page are printed as well.
 
 Numbers in the query ("14" in "laravel 14") must appear in a result, paragraph, or sentence to count.
 """
+import datetime
 import functools
 import json
 import math
@@ -47,20 +49,24 @@ MIN_SENT_WORDS = 6
 AGREE_FLOOR = 0.85         # sentences from two pages agree only above this cosine ...
 AGREE_PERCENTILE = 0.95    # ... and above this percentile of all cross-page sentence pairs
 MAX_SUPPORT = 3            # pages named as support for one sentence at most
-DUP = 0.92                 # cosine above which two sentences are near duplicates
+DUP = 0.88                 # cosine above which two sentences are near duplicates
+CONTAIN = 0.70             # share of the shorter sentence's content words found in a chosen one
 CONSENSUS_BONUS = 0.08     # score bonus when other pages agree (two pages count at most)
 SENT_PHRASE_BONUS = 0.05   # the sentence holds the query words next to each other
 FACT_BONUS = 0.04          # dates, versions, and other numbers (three count at most)
 RANK_BONUS = 0.04          # sentences from higher ranked pages score a little higher
 YOU_PENALTY = 0.05         # "you/your" voice (tutorials, marketing)
+STALE_PENALTY = 0.15       # a forecast ("expected", "scheduled", ...) whose dates are all in the past
 
 STOP = set("""the a an of in on for to and or is are was were be what how why when where which who
 about with web search websearch lookup look up cari carikan tentang di internet online dan yang
 apa itu untuk dari""".split())
+FUNC = STOP | set("with as it its by that this from at up than so".split())
 TOKEN = re.compile(r"\w+(?:\.\w+)*")
 CODE_CHARS = set("$;{}<>[]=\\|`")
 SENT_SPLIT = re.compile(r'(?<=[.!?])\s+(?=[A-Z0-9"“(\[])')
-SENT_END = re.compile(r"(?:[.!?][\"”')\]]*|\.{3}|…)$")
+SENT_END = re.compile(r"[.!?][\"”')\]]*$")
+CUT_END = re.compile(r"(?:\.{2,}|…)$")
 BOILER = re.compile(
     r"\b(cookies?|subscribe|newsletter|sign up|log in|privacy policy|terms of (?:use|service)|"
     r"all rights reserved|follow us|share this|read more|advertisement|click here|table of contents)\b",
@@ -69,7 +75,21 @@ BOILER = re.compile(
 ANAPHORA = re.compile(
     r"^(?:this|that|these|those|it|its|they|their|he|she|here|there|but|and|so|also|however|then|such|"
     r"none|nothing|whatever|anything|everything|otherwise|instead|thus|therefore|meanwhile)\b", re.I)
+# sentences that describe the article instead of stating a fact
+META = re.compile(
+    r"^(?:what (?:is|are|we|you)\b|here(?:'s| is| are)\b|in this (?:article|post|guide|video|tutorial)\b|"
+    r"this (?:article|post|guide|video|tutorial)\b|everything you\b|learn\b|discover\b|find out\b|"
+    r"read on\b|let's\b|let me\b|welcome\b|introduction\b)", re.I)
 YOU = re.compile(r"\b(?:you|your|yours|you'll|you've|you're|yourself)\b", re.I)
+
+MONTHS = {m: i for i, m in enumerate("jan feb mar apr may jun jul aug sep oct nov dec".split(), 1)}
+DATE_Q = re.compile(r"\bQ([1-4])\s*(20\d\d)\b", re.I)
+DATE_M = re.compile(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+"
+                    r"(?:\d{1,2}(?:st|nd|rd|th)?,?\s+)?(20\d\d)\b", re.I)
+DATE_Y = re.compile(r"\b(20\d\d)\b")
+FORECAST = re.compile(
+    r"\b(?:expected|scheduled|will (?:be|launch|release|arrive|land|ship|come)|upcoming|"
+    r"coming (?:in|soon)|set to|planned|slated|due|launch(?:es|ing) in|next major|should arrive)\b", re.I)
 
 
 def debug_on():
@@ -272,12 +292,13 @@ def excerpts(text, words, nums, phrase, strict):
 
 
 def good_sentence(s):
-    """A complete sentence that still makes sense on its own (no titles, breadcrumbs, or 'This is ...')."""
+    """A complete sentence that still makes sense on its own (no titles, breadcrumbs, 'This is ...', cut-offs)."""
     return (MIN_SENT_CHARS <= len(s) <= 420 and len(s.split()) >= MIN_SENT_WORDS
             and (s[0].isupper() or s[0].isdigit())
-            and bool(SENT_END.search(s)) and not s.endswith("?")
+            and not CUT_END.search(s) and bool(SENT_END.search(s)) and not s.endswith("?")
             and s.count("/") < 2
-            and not ANAPHORA.match(s) and not BOILER.search(s) and not looks_like_noise(s))
+            and not ANAPHORA.match(s) and not META.match(s)
+            and not BOILER.search(s) and not looks_like_noise(s))
 
 
 def page_sentences(text):
@@ -295,12 +316,44 @@ def page_sentences(text):
     return out
 
 
-def snippet_sentence(snippet):
-    """The search snippet as one sentence (for pages that could not be read), without its date prefix."""
+def snippet_sentences(snippet):
+    """Complete sentences of a search snippet (for pages that could not be read).
+
+    Search engines cut snippets with '...': the cut-off sentence is kept only up to its last complete clause.
+    """
     s = " ".join(snippet.split())
     s = re.sub(r"^[A-Z][a-z]{2} \d{1,2}, \d{4}\s*(?:\.{2,}|…)?\s*", "", s)
     s = re.sub(r"\s+([,.;:!?])", r"\1", s).strip()
-    return s if s and good_sentence(s) else ""
+    cut = bool(CUT_END.search(s))
+    if cut:
+        s = re.sub(r"\s*(?:\.{2,}|…)$", "", s)
+    parts = [p.strip() for p in SENT_SPLIT.split(s) if p.strip()]
+    if cut and parts and not SENT_END.search(parts[-1]):
+        last = parts.pop()
+        at = max(last.rfind(", "), last.rfind(" — "), last.rfind("; "))
+        if at >= MIN_SENT_CHARS:
+            parts.append(last[:at] + ".")
+    return [p for p in parts if good_sentence(p)]
+
+
+# ---------------------------------------------------------------- dates
+
+def end_dates(text):
+    """Dates a sentence mentions, as the last days of their quarter, month, or year."""
+    out = []
+    for q, y in DATE_Q.findall(text):
+        out.append(datetime.date(int(y), int(q) * 3, 28))
+    for m, y in DATE_M.findall(text):
+        out.append(datetime.date(int(y), MONTHS[m.lower()[:3]], 28))
+    if not out:  # a bare year only counts when nothing more precise is there
+        out = [datetime.date(int(y), 12, 28) for y in DATE_Y.findall(text)]
+    return out
+
+
+def stale_forecast(text, today=None):
+    """True for 'expected / scheduled / launches in ...' sentences whose dates are all already in the past."""
+    dates = end_dates(text)
+    return bool(dates) and max(dates) < (today or datetime.date.today()) and bool(FORECAST.search(text))
 
 
 # ---------------------------------------------------------------- the answer
@@ -321,11 +374,7 @@ def build_candidates(pairs, words, nums, phrase, strict):
     plain = [w for w in words if w not in nums]
     cands, seen = [], set()
     for r, (page, _err) in pairs:
-        if page is not None:
-            pool = page_sentences(page[4])
-        else:
-            one = snippet_sentence(r["snippet"])
-            pool = [one] if one else []
+        pool = page_sentences(page[4]) if page is not None else snippet_sentences(r["snippet"])
         scored = []
         for s in pool:
             score, hits = lexical(s, words, phrase)
@@ -362,9 +411,14 @@ def assign_support(cands):
     return threshold
 
 
+def content_words(text):
+    return {w for w in TOKEN.findall(text.lower()) if w not in FUNC}
+
+
 def duplicate(a, b):
-    wa, wb = set(TOKEN.findall(a["text"].lower())), set(TOKEN.findall(b["text"].lower()))
-    if wa and wb and len(wa & wb) / len(wa | wb) >= 0.7:
+    """Near duplicates: most content words of the shorter sentence are in the other, or the cosine is high."""
+    wa, wb = content_words(a["text"]), content_words(b["text"])
+    if wa and wb and len(wa & wb) / min(len(wa), len(wb)) >= CONTAIN:
         return True
     return bool(a.get("vec") and b.get("vec")) and dot(a["vec"], b["vec"]) >= DUP
 
@@ -409,16 +463,19 @@ def print_answer(query, pairs, words, nums, phrase, strict, width):
             c.pop("vec", None)
             c["support"] = []
 
+    today = datetime.date.today()
     for c in cands:
         qcos = sum(dot(q, c["vec"]) for q in qvecs) / len(qvecs) if qvecs else c["lex"]
         facts = [t for t in re.findall(r"\d+(?:\.\d+)*", c["text"]) if t not in nums]
         c["qcos"] = qcos
+        c["stale"] = stale_forecast(c["text"], today)
         c["score"] = (qcos
                       + (SENT_PHRASE_BONUS if phrase and phrase.search(c["text"]) else 0.0)
                       + CONSENSUS_BONUS * min(len(c["support"]), 2) / 2
                       + FACT_BONUS * min(len(facts), 3) / 3
                       + RANK_BONUS * (TRIES - min(c["src"], TRIES)) / TRIES
-                      - (YOU_PENALTY if YOU.search(c["text"]) else 0.0))
+                      - (YOU_PENALTY if YOU.search(c["text"]) else 0.0)
+                      - (STALE_PENALTY if c["stale"] else 0.0))
 
     chosen = select(cands)
     if not chosen:
@@ -447,7 +504,8 @@ def print_answer(query, pairs, words, nums, phrase, strict, width):
         print("\n== Answer candidates (debug): score, query cosine, supporting pages, page, sentence ==")
         for c in sorted(cands, key=lambda c: -c["score"])[:10]:
             mark = "*" if c in chosen else " "
-            print(f"{mark} {c['score']:.3f} q={c['qcos']:.3f} sup={len(c['support'])} "
+            stale = " stale" if c["stale"] else ""
+            print(f"{mark} {c['score']:.3f} q={c['qcos']:.3f} sup={len(c['support'])}{stale} "
                   f"[{c['src']}] {textwrap.shorten(c['text'], width=100, placeholder='...')}")
         if threshold is not None:
             print(f"(agreement threshold {threshold:.3f}, {len(cands)} candidate sentences)")
