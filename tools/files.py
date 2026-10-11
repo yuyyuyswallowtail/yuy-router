@@ -140,10 +140,22 @@ def files_under(root):
 # ---------------------------------------------------------------- file actions
 
 def do_search(s):
-    quoted, rest, path = parse(s, quoted_path=False, bare=False)
-    root = resolve(path or ".")
-    if not os.path.isdir(root):
-        die(f"Not a folder: {root}")
+    quoted = [a or b or c for a, b, c in QUOTED.findall(s)]
+    words = QUOTED.sub(" ", s).split()
+    root_path = None
+    for i in range(len(words) - 1, -1, -1):  # last existing folder wins: "main.go di /home/me"
+        c = clean(words[i])
+        if looks_like_path(c) and os.path.isdir(os.path.expanduser(c)):
+            root_path = c
+            del words[i]
+            break
+    if root_path is None:
+        for w in words:
+            c = clean(w)
+            if c.startswith(("~", "/", "./", "../")):
+                die(f"Not a folder: {os.path.abspath(os.path.expanduser(c))}")
+    rest = " ".join(words)
+    root = resolve(root_path or ".")
     term = quoted[0] if quoted else " ".join(w for w in rest.split() if w.lower().strip(",.") not in STOP)
     if not term:
         die('Nothing to search for. Example: search "TODO" in ~/Projects')
