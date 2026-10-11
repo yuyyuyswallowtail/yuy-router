@@ -99,5 +99,59 @@
     "sudo": true,
     "timeout": 3600,
     "keywords": ["update system", "system update", "upgrade system", "pacman", "update sistem", "upgrade sistem"]
+  },
+  {
+    "desc": "search files by name or text inside a folder, or search the web for information about a topic",
+    "cmd": ["python3", "{ROOT}/tools/files.py", "search"],
+    "cwd": ".",
+    "args": "query",
+    "timeout": 90,
+    "boost": 0.25,
+    "keywords": ["search", "find file", "find files", "look for", "look up", "lookup", "cari", "carikan", "temukan", "web search", "websearch"]
+  },
+  {
+    "desc": "read and show the contents of a text file, optionally only a range of lines",
+    "cmd": ["python3", "{ROOT}/tools/files.py", "read"],
+    "cwd": ".",
+    "args": "query",
+    "keywords": ["read", "baca", "show file", "show content", "tampilkan isi", "lihat isi", "cat"]
+  },
+  {
+    "desc": "create a new file with the given text content, or create a new folder",
+    "cmd": ["python3", "{ROOT}/tools/files.py", "create"],
+    "cwd": ".",
+    "args": "query",
+    "keywords": ["create", "buat", "buatkan", "bikin", "new file", "file baru", "new folder", "folder baru", "mkdir", "touch"]
+  },
+  {
+    "desc": "edit an existing file: replace one text with another text, or append text to the end of the file",
+    "cmd": ["python3", "{ROOT}/tools/files.py", "edit"],
+    "cwd": ".",
+    "args": "query",
+    "confirm": true,
+    "keywords": ["edit", "replace", "ganti", "ubah", "ubahkan", "append", "tambahkan", "modify"]
+  },
+  {
+    "desc": "delete a file or folder by moving it to the trash so it can be restored",
+    "cmd": ["python3", "{ROOT}/tools/files.py", "delete"],
+    "cwd": ".",
+    "args": "query",
+    "confirm": true,
+    "keywords": ["delete", "remove", "hapus", "buang", "rm", "trash"]
+  },
+  {
+    "desc": "fetch a web page from a URL and show its text content in the terminal",
+    "cmd": ["python3", "{ROOT}/tools/files.py", "fetch"],
+    "cwd": "~",
+    "args": "query",
+    "timeout": 90,
+    "keywords": ["fetch", "scrape", "download page", "get page", "ambil halaman", "unduh halaman", "isi halaman"]
+  },
+  {
+    "desc": "open a URL or website in the web browser",
+    "cmd": ["python3", "{ROOT}/tools/files.py", "browser"],
+    "cwd": "~",
+    "args": "query",
+    "keywords": ["open in browser", "open in the browser", "buka di browser", "buka browser", "open website", "buka website", "buka situs", "open url", "browse"]
   }
 ]
