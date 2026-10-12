@@ -139,7 +139,8 @@ HL_HEAD = re.compile(r"\b(?:new|features?|highlights?|improvements?|changes?|add
 HL_JUNK = re.compile(r"^(?:download|install\w*|contribut\w*|related|summary|conclusion|introduction|overview|faq|"
                      r"comments?|share|references?|see also|resources?|about|changelog|credits|sponsors?|"
                      r"final thoughts|upgrad\w+|migration|wrapping up|key takeaways|table of contents|what'?s next|"
-                     r"getting started|support|requirements?|more)\b", re.I)
+                     r"getting started|support|requirements?|more|other|misc\w*|minor|bonus|extras?|how to|frequently asked|"
+                     r"keep reading|need help|want to|further reading|read more)\b", re.I)
 HL_REQ = re.compile(r"\b(?:minimum|requirements?|requires?)\b", re.I)  # a requirement is a fact, not a feature
 NAME_BAD = re.compile(
     r"^(?:find|see|turn|get|test|run|make|read|start|stop|set|add|enable|disable|install|update|upgrade|migrate|"
@@ -166,6 +167,52 @@ CONTRAST = re.compile(r"\b(?:not|no|never|but|however|although|though|despite|un
 LOWER_FIRST = {"The", "A", "An", "It", "Its", "This", "These", "Those", "There"}
 TRANSITIONS = {2: "In addition,", 3: "Moreover,"}   # by position in the paragraph (0 = topic sentence)
 NOT_TOPIC = {"opinion", "advice", "vague", "you", "stale"}
+# rhetoric instead of a definition: "isn't just about the present—it's laying groundwork for ..."
+RHETORIC = re.compile(r"\b(?:isn[’']t just|not just|more than just|laying (?:the )?groundwork|groundwork for|"
+                      r"what[’']s (?:coming|next|ahead))\b|\w—\w", re.I)
+CODE_TOKEN = re.compile(r"\w\(\)|::|->|\$\w|#\[")   # an API name: too specific to say what the subject is
+# headings where the list of features is over: how to upgrade, FAQ, other posts
+END_HEAD = re.compile(r"^(?:how to\b|frequently asked|keep reading|need help|want to\b|further reading|read more|"
+                      r"what[’']?s next|more from)", re.I)
+# only these finite verbs count (no words that are often nouns, like release, change, list, use)
+MAIN_VERB = re.compile(
+    r"\b(?:is|are|was|were|be|been|has|have|had|will|would|can|could|should|may|might|must|does|did|"
+    r"adds?|aims?|allows?|arrives?|becomes?|brings?|builds?|continues?|delivers?|describes?|drops?|enables?|"
+    r"ends?|extends?|focuses|follows?|gets?|gives?|improves?|includes?|introduces?|keeps?|lands?|"
+    r"launche[sd]|lets?|makes?|marks?|moves?|offers?|promises?|provides?|raises?|removes?|replaces?|"
+    r"requires?|runs?|seeks?|ships?|starts?|supports?|takes?|targets?|uses?|works?)\b", re.I)
+CLAUSE_WORD = re.compile(r"\b(?:what|that|which|who|whose|where|when|how|whether)\b", re.I)
+GENERIC_QUERY = {"release", "released", "version", "versions", "new", "features", "feature", "changes",
+                 "change", "changelog", "update", "updates", "news", "about", "guide", "tutorial", "date",
+                 "notes", "latest", "review"}
+
+
+def has_main_verb(text):
+    """False for fragments like 'The expected release window and what the team has announced.': a main verb
+    has to come before the first 'what / that / which / ...' clause."""
+    m = MAIN_VERB.search(text)
+    if not m:
+        return False
+    clause = CLAUSE_WORD.search(text)
+    return clause is None or m.start() < clause.start()
+
+
+def core_subject_re(words, nums):
+    """The subject without generic words: 'php 8.4 release' -> 'php 8.4'. A topic sentence starts with it."""
+    core = [w for w in words if w not in GENERIC_QUERY]
+    if not core:
+        return None
+    sep = r"[\W_]{1,3}(?:v(?=\d))?"
+    return re.compile(r"^(?:the\s+)?" + sep.join(re.escape(w) for w in core), re.I)
+
+
+def core_defines(text, core):
+    """The sentence starts with the core subject and a verb: 'PHP 8.4 is a major update ...'."""
+    m = core.match(text)
+    return bool(m and SUBJECT_VERB.match(text[m.end():].lstrip()))
+
+
+TOPIC_DEFINE_BONUS = 0.04  # topic sentence: the subject followed by a verb ("Laravel 13 continues ...")
 
 MONTHS = {m: i for i, m in enumerate("jan feb mar apr may jun jul aug sep oct nov dec".split(), 1)}
 DATE_Q = re.compile(r"\bQ([1-4])\s*(20\d\d)\b", re.I)
@@ -611,7 +658,7 @@ def score_candidate(c, qvecs, nums, phrase, subject, today):
     if stale_forecast(text, today):
         score -= STALE_PENALTY
         flags.append("stale")
-    if OPINION.search(text):
+    if OPINION.search(text) or RHETORIC.search(text):
         score -= OPINION_PENALTY
         flags.append("opinion")
     if ADVICE.match(text):
@@ -620,9 +667,12 @@ def score_candidate(c, qvecs, nums, phrase, subject, today):
     if VAGUE.search(text) and text.count(",") < 2:  # a list of named things is specific enough
         score -= VAGUE_PENALTY
         flags.append("vague")
-    if subject and subject.match(text):
+    m = subject.match(text) if subject else None
+    if m:
         score += SUBJECT_BONUS
         flags.append("subject")
+        if SUBJECT_VERB.match(text[m.end():].lstrip()):
+            flags.append("defines")
     if c.get("pos") is not None and c["pos"] < LEAD_SENTENCES:
         score += LEAD_BONUS
         flags.append("lead")
@@ -677,6 +727,90 @@ def part_of(name, raw):
     return bool(re.search(rf"\b{re.escape(name.lower().rstrip('s'))}s?\b", raw.lower()))
 
 
+NOTE_CANDS = 8             # candidate sentences kept per feature section
+NOTE_MIN_SCORE = 0.5       # an explanation scoring below this is left out: no note beats a background one
+# "As noted in the previous section, ...": points at text that is not here
+PREV_REF = re.compile(r"\b(?:as (?:noted|mentioned|discussed|described|shown|seen) (?:in|above|earlier|before|previously)|"
+                      r"(?:in )?the (?:previous|preceding|last|above) (?:section|paragraph|chapter)|see above)\b", re.I)
+# says what the feature is or does
+INTRO_VERB = re.compile(r"\b(?:introduc\w+|adds?|added|provid\w+|allows?|allowing|lets?|enabl\w+|support\w*|brings?|"
+                        r"offers?|now|new|gives?|ships?|includes?)\b", re.I)
+# background: the problem or the history, not the feature
+BACKGROUND = re.compile(r"\b(?:raised issues|posed challenges|(?:has|have) posed|for many years|has been around|lingered|"
+                        r"historically|traditionally|not everything|not uncommon|work around|long been|in the past|"
+                        r"used to|initially provided|have needed to)\b", re.I)
+BEFORE = re.compile(r"^(?:previously|before\b|prior to|until now|in earlier)", re.I)
+
+
+def drop_opener(s):
+    """'Not everything is X; the release adds Y.' -> 'The release adds Y.' (the point is after the opener)."""
+    if re.match(r"^(?:not|while|although|though)\b", s, re.I):
+        for sep in ("; ", ", "):
+            if sep in s:
+                tail = s.split(sep, 1)[1].strip()
+                if len(tail) >= 30 and (sep == "; " or re.match(r"^(?:while|although|though)\b", s, re.I)):
+                    return tail[0].upper() + tail[1:]
+    return s
+
+
+def fitting_sentences(block):
+    """Complete sentences among the first four of a paragraph that can explain a feature."""
+    out = []
+    for s in SENT_SPLIT.split(REF_MARK.sub("", block))[:4]:
+        s = drop_opener(trim_fluff(s.strip()))
+        if (25 <= len(s) <= 300 and len(s.split()) >= 5 and SENT_END.search(s) and not s.endswith("?")
+                and not CUT_END.search(s) and not BOILER.search(s) and not META.match(s) and not PREV_REF.search(s)
+                and not DANGLING.search(s) and not OPINION.search(s) and not RHETORIC.search(s)
+                and not ANAPHORA.match(s) and not looks_like_noise(s)):
+            out.append(s)
+    return out
+
+
+def explain_score(s, want):
+    """How well a sentence says what a feature is or does: it names the feature and has an 'introduces / adds /
+    allows / now / new' verb; background ('has raised issues for years', 'Previously, ...') scores low."""
+    score = 2.0 if want and content_words(s) & want else 0.0
+    score += 0.8 * min(len(INTRO_VERB.findall(s)), 2)
+    if BACKGROUND.search(s):
+        score -= 3.0
+    if BEFORE.match(s):
+        score -= 1.5
+    if 40 <= len(s) <= 220:
+        score += 0.4
+    return score
+
+
+def best_note(cands, name):
+    """The candidate that best explains the feature (the earliest wins ties). '' when none is good enough."""
+    if not cands:
+        return ""
+    want = content_words(name)
+    score, _, note = max((explain_score(s, want), -i, s) for i, s in enumerate(cands))
+    return note if score >= NOTE_MIN_SCORE else ""
+
+
+def section_note(name, sections, log=None):
+    """The explanation of a feature that a list only names: the first sentence of the section whose heading
+    contains every word of the name ('Property Hooks' -> the section 'Property Hooks in PHP 8.4'). The section
+    with the shortest heading wins. '' when there is none."""
+    want = content_words(name)
+    if not want:
+        return ""
+    best, best_words = None, 0
+    for sec in sections:
+        if not sec["cands"]:
+            continue
+        have = content_words(sec["title"])
+        if want <= have and (best is None or len(have) < best_words):
+            best, best_words = sec, len(have)
+    if best is None:
+        return ""
+    note = best_note(best["cands"], name)
+    if log and note:
+        log(f"note for {name!r} from the section {best['title']!r}")
+    return note
+
+
 def page_features(text, nums=(), trace=None):
     """-> (features, strong). Features of a release page as {"name", "note", "raw", "parts"}: the headings one
     level below a 'New features' / 'Release' heading (deeper headings, and one-word headings that the section
@@ -688,15 +822,24 @@ def page_features(text, nums=(), trace=None):
             trace.append(msg)
 
     heads, items, parent, child, strong, cur = [], [], 0, 0, False, None
+    sections, sec = [], None   # every heading with the first fitting sentence below it (see section_note)
     for b in blocks(text):
+        if not b.startswith("#") and sec is not None and len(sec["cands"]) < NOTE_CANDS:
+            sec["cands"].extend(fitting_sentences(b))
         if b.startswith("#"):
             level, title = len(b) - len(b.lstrip("#")), b.lstrip("#").strip()
+            sec = {"title": title, "cands": []}
+            sections.append(sec)
             tag = f"h{level} {textwrap.shorten(title, width=60, placeholder='...')!r}"
             other = VERSIONED.match(title)
             if other and nums and other.group(1) not in nums:  # a section about another version: stop collecting
                 parent = child = 0
                 cur = None
                 log(f"{tag}: section about another version, stop")
+            elif parent and (CLOSING.match(title) or END_HEAD.match(title)):
+                parent = child = 0
+                cur = None
+                log(f"{tag}: closing section, stop")
             elif parent and level > parent:
                 if not child:
                     child = level
@@ -708,7 +851,7 @@ def page_features(text, nums=(), trace=None):
                         cur = prev
                         log(f"{tag}: part of {prev['name']!r}")
                     elif name:
-                        cur = {"name": name, "note": "", "raw": "", "parts": []}
+                        cur = {"name": name, "note": "", "raw": "", "parts": [], "cands": []}
                         heads.append(cur)
                         log(f"{tag}: feature {name!r}")
                     else:
@@ -735,9 +878,16 @@ def page_features(text, nums=(), trace=None):
         elif parent and cur is not None:
             if len(cur["raw"]) < HL_RAW_CHARS:
                 cur["raw"] = f"{cur['raw']} {b}".strip()
-            if not cur["note"]:
-                cur["note"] = note_sentence(b)
-    return (heads if len(heads) >= 3 else items), strong
+            if len(cur["cands"]) < NOTE_CANDS:
+                cur["cands"].extend(fitting_sentences(b))
+    for f in heads:
+        if not f["note"]:
+            f["note"] = best_note(f["cands"], f["name"])
+    feats = heads if len(heads) >= 3 else items
+    for f in feats:
+        if not f["note"]:
+            f["note"] = section_note(f["name"], sections, log)
+    return feats, strong
 
 
 def collect_highlights(pairs, words=(), nums=(), trace=None):
@@ -829,11 +979,13 @@ def pick_topic(cands, points):
     top = max(c["score"] for c in cands)
     pool = [c for c in cands
             if not c["facts"] and not end_dates(c["text"]) and not NOT_TOPIC & set(c["flags"])
+            and not CODE_TOKEN.search(c["text"]) and c.get("defines_core") and has_main_verb(c["text"])
             and c["score"] >= top - FEATURE_WINDOW and not mentions_point(c["text"], points)]
     if not pool:
         return None
     return max(pool, key=lambda c: c["qwhat"] + (TOPIC_LEAD_BONUS if "lead" in c["flags"] else 0.0)
-               + (TOPIC_SUBJECT_BONUS if "subject" in c["flags"] else 0.0))
+               + (TOPIC_SUBJECT_BONUS if "subject" in c["flags"] else 0.0)
+               + (TOPIC_DEFINE_BONUS if "defines" in c["flags"] else 0.0))
 
 
 def arrange(chosen, cands, points):
@@ -854,8 +1006,10 @@ def arrange(chosen, cands, points):
         else:
             plain.append(c)
     topic = pick_topic(cands, points)
-    if topic is None and plain:
-        topic = max(plain, key=lambda c: ("lead" in c["flags"], c["score"]))
+    plain = [c for c in plain if has_main_verb(c["text"])]  # drop fragments like "The expected release window and ..."
+    general = [c for c in plain if not CODE_TOKEN.search(c["text"])]
+    if topic is None and general:
+        topic = max(general, key=lambda c: ("lead" in c["flags"], c["score"]))
     rest = sorted(numeric, key=lambda c: (fact_rank(c["text"]), -c["score"]))
     rest += sorted((c for c in plain if c is not topic), key=lambda c: -c["score"])
     if topic is None and rest:
@@ -877,7 +1031,8 @@ def compose_paragraph(topic, supports, subject, nums):
     refers = bool(subject and nums and subject.match(topic["text"]))  # "It" needs a clear subject to point at
     words_used, leftover, run = len(topic["text"].split()), [], 0
     for c in supports:
-        if len(items) >= PARA_SENTENCES or words_used >= PARA_WORDS or YOU.search(c["text"]):
+        if (len(items) >= PARA_SENTENCES or words_used >= PARA_WORDS or YOU.search(c["text"])
+                or CODE_TOKEN.search(c["text"])):
             leftover.append(c)
             continue
         text, pronoun = c["text"], False
@@ -914,7 +1069,8 @@ def highlight_line(g, label):
     parts = [p for p in dict.fromkeys(g.get("parts", [])) if p.lower() != name.lower()][:4]
     extra = f" ({', '.join(parts)})" if parts else ""
     note = short_note(g["note"]) if g.get("note") else ""
-    if note and note.lower().startswith(name.lower()):  # the sentence already starts with the name
+    bare = re.sub(r"^(?:the|a|an)\s+", "", note, flags=re.I)
+    if note and bare.lower().startswith(name.lower()):  # the sentence already starts with the name
         return f"{note}{extra} {label}"
     return f"{name}{extra}: {note} {label}" if note else f"{name}{extra} {label}"
 
@@ -943,8 +1099,12 @@ def print_answer(query, pairs, words, nums, phrase, strict, width):
     debug = debug_on()
     today = datetime.date.today()
     subject = subject_re(words, phrase)
+    core = core_subject_re(words, nums)
     for c in cands:
         score_candidate(c, qvecs, nums, phrase, subject, today)
+        c["defines_core"] = bool(core and core_defines(c["text"], core))
+        if c["defines_core"]:
+            c["flags"].append("core")
 
     trace = {} if debug else None
     points = collect_highlights(pairs, words, nums, trace) if HL_QUERY.search(query) else []
