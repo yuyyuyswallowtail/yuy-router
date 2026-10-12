@@ -170,6 +170,11 @@ NOT_TOPIC = {"opinion", "advice", "vague", "you", "stale"}
 # rhetoric instead of a definition: "isn't just about the present—it's laying groundwork for ..."
 RHETORIC = re.compile(r"\b(?:isn[’']t just|not just|more than just|laying (?:the )?groundwork|groundwork for|"
                       r"what[’']s (?:coming|next|ahead))\b|\w—\w", re.I)
+# sentences that only work inside their own page: a person ("he"), "last year", "we", "note that", hype
+VOICE = re.compile(r"\b(?:he|she|his|hers?|him|himself|herself)\b|^(?:last|this|next) (?:year|month|week)\b|"
+                   r"\bwe(?:[’']ll|[’']re|[’']ve)?\b|\bour\b|^note that\b|"
+                   r"^for (?:developers|users|those|anyone|people|teams) (?:who|that)\b|"
+                   r"\b(?:huge|massive|giant) (?:chunk|amount|boost|leap)\b", re.I)
 CODE_TOKEN = re.compile(r"\w\(\)|::|->|\$\w|#\[")   # an API name: too specific to say what the subject is
 # headings where the list of features is over: how to upgrade, FAQ, other posts
 END_HEAD = re.compile(r"^(?:how to\b|frequently asked|keep reading|need help|want to\b|further reading|read more|"
@@ -447,6 +452,7 @@ def good_sentence(s):
             and not CUT_END.search(s) and bool(SENT_END.search(s)) and not s.endswith("?")
             and s.count("/") < 2
             and not ANAPHORA.match(s) and not META.match(s) and not DANGLING.search(s)
+            and not VOICE.search(s) and not s.endswith("!")
             and not BOILER.search(s) and not looks_like_noise(s))
 
 
@@ -712,9 +718,10 @@ def item_note(item):
         return ""
     rest = SENT_SPLIT.split(parts[1].strip())[0].strip()
     if len(rest) < 20 or len(rest.split()) < 4 or OPINION.search(rest) or BOILER.search(rest) \
-            or DANGLING.search(rest) or looks_like_noise(rest):
+            or DANGLING.search(rest) or VOICE.search(rest) or rest.endswith("!") or looks_like_noise(rest):
         return ""
-    rest = rest[0].upper() + rest[1:]
+    if re.match(r"[a-z]+(?![\w(:])", rest):  # a plain word: not mb_trim() or cache::touch()
+        rest = rest[0].upper() + rest[1:]
     return rest if SENT_END.search(rest) else rest.rstrip(" ,;:") + "."
 
 
@@ -761,7 +768,8 @@ def fitting_sentences(block):
         if (25 <= len(s) <= 300 and len(s.split()) >= 5 and SENT_END.search(s) and not s.endswith("?")
                 and not CUT_END.search(s) and not BOILER.search(s) and not META.match(s) and not PREV_REF.search(s)
                 and not DANGLING.search(s) and not OPINION.search(s) and not RHETORIC.search(s)
-                and not ANAPHORA.match(s) and not looks_like_noise(s)):
+                and not ANAPHORA.match(s) and not looks_like_noise(s)
+                and not VOICE.search(s) and not s.endswith("!")):
             out.append(s)
     return out
 
@@ -1053,15 +1061,20 @@ def fill(text, width, first, rest):
                          break_long_words=False, break_on_hyphens=False)
 
 
+CLAUSE_CUTS = (", ", "; ", " — ", " - ", " which ", " because ", " while ", " so that ", " allowing ", " enabling ")
+
+
 def short_note(s, limit=NOTE_CHARS):
-    """A long explanation cut at the last clause before the limit, so it still reads as a sentence."""
+    """A long explanation cut at the last clause before the limit, so it still reads as a sentence. Without a
+    clause to cut at, a sentence a little over the limit stays whole and a much longer one is left out: a
+    note that stops in the middle of a thought is worse than none."""
     s = s.strip()
     if len(s) <= limit:
         return s
-    cut = max(s.rfind(", ", 0, limit), s.rfind("; ", 0, limit), s.rfind(" — ", 0, limit), s.rfind(" - ", 0, limit))
+    cut = max(s.rfind(c, 0, limit) for c in CLAUSE_CUTS)
     if cut >= 50:
         return s[:cut].rstrip(" ,;:—-") + "."
-    return textwrap.shorten(s, width=limit, placeholder="...")
+    return s if len(s) <= limit + 60 else ""
 
 
 def highlight_line(g, label):
